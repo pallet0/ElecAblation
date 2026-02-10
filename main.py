@@ -386,18 +386,32 @@ def plot_progressive_ablation_curves(results):
     plt.close()
 
 
+def _make_topo_info():
+    """Create MNE Info with valid montage positions for SEED-IV channels."""
+    import mne
+    mapped_names = [MNE_NAME_MAP.get(n, n) for n in CHANNEL_NAMES]
+    info = mne.create_info(ch_names=mapped_names, sfreq=1, ch_types='eeg')
+    montage = mne.channels.make_standard_montage('standard_1005')
+    info.set_montage(montage, on_missing='ignore')
+    # Filter to channels that received valid montage positions
+    picks = [i for i, ch in enumerate(info['chs'])
+             if not np.allclose(ch['loc'][:3], 0)]
+    if len(picks) < len(mapped_names):
+        missing = [CHANNEL_NAMES[i] for i in range(len(CHANNEL_NAMES))
+                   if i not in picks]
+        print(f"  Warning: {len(missing)} channels without montage positions "
+              f"excluded from topomap: {missing}")
+    return mne.pick_info(info, picks), np.array(picks)
+
+
 def plot_topographic_attention(grand_importance,
                                title='Channel Attention Weights (Grand Average)',
                                filename='topomap_attention.pdf'):
     import matplotlib.pyplot as plt
     import mne
-
-    mapped_names = [MNE_NAME_MAP.get(n, n) for n in CHANNEL_NAMES]
-    info = mne.create_info(ch_names=mapped_names, sfreq=1, ch_types='eeg')
-    montage = mne.channels.make_standard_montage('standard_1005')
-    info.set_montage(montage, on_missing='ignore')
+    info, picks = _make_topo_info()
     fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-    mne.viz.plot_topomap(grand_importance, info, axes=ax, show=False,
+    mne.viz.plot_topomap(grand_importance[picks], info, axes=ax, show=False,
                          cmap='RdYlBu_r', contours=0)
     ax.set_title(title, fontsize=13)
     plt.savefig(filename, dpi=300, bbox_inches='tight')
@@ -452,14 +466,11 @@ def plot_per_emotion_topomap(emotion_importances):
     import matplotlib.pyplot as plt
     import mne
 
-    mapped_names = [MNE_NAME_MAP.get(n, n) for n in CHANNEL_NAMES]
-    info = mne.create_info(ch_names=mapped_names, sfreq=1, ch_types='eeg')
-    montage = mne.channels.make_standard_montage('standard_1005')
-    info.set_montage(montage, on_missing='ignore')
+    info, picks = _make_topo_info()
     emotion_labels = {0: 'Neutral', 1: 'Sad', 2: 'Fear', 3: 'Happy'}
     fig, axes = plt.subplots(1, N_CLASSES, figsize=(5 * N_CLASSES, 5))
     for c in range(N_CLASSES):
-        mne.viz.plot_topomap(emotion_importances[c], info, axes=axes[c],
+        mne.viz.plot_topomap(emotion_importances[c][picks], info, axes=axes[c],
                              show=False, cmap='RdYlBu_r', contours=0)
         axes[c].set_title(emotion_labels.get(c, str(c)), fontsize=13)
     plt.suptitle('Per-Emotion Channel Attention', fontsize=15, y=1.02)
@@ -533,7 +544,8 @@ if __name__ == '__main__':
     # ── Phase 1: Hyperparameter search ──
     if args.skip_search:
         best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
-                             'd_hidden': 64, 'dropout': 0.5}
+                             'd_hidden': 64, 'dropout': 0.3, 'n_heads': 4,
+                             'dim_feedforward': 128}
         best_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
                              'max_epochs': 200, 'patience': 10}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
@@ -544,23 +556,26 @@ if __name__ == '__main__':
     else:
         print("\n=== Phase 1a: Attention HP search (5-fold CV) ===")
         search_space = {
-            'd_hidden': [32, 64],
+            'd_hidden': [64],
+            'dim_feedforward': [64, 128],
             'dropout':  [0.3, 0.5],
-            'lr':       [1e-3, 5e-4, 1e-4],
-            'wd':       [1e-5, 1e-4],
+            'lr':       [5e-4, 1e-4],
+            'wd':       [1e-4, 5e-4],
             'batch_size': [64, 128],
         }
         best_score = 0.0
         best_model_kwargs = None
         best_train_kwargs = None
         configs_1a = list(itertools.product(
-            search_space['d_hidden'], search_space['dropout'],
+            search_space['d_hidden'], search_space['dim_feedforward'],
+            search_space['dropout'],
             search_space['lr'], search_space['wd'], search_space['batch_size'],
         ))
         pbar_1a = tqdm(configs_1a, desc='Attention HP search')
-        for d_h, drop, lr, wd, bs in pbar_1a:
+        for d_h, d_ff, drop, lr, wd, bs in pbar_1a:
             mk = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
-                   'd_hidden': d_h, 'dropout': drop}
+                   'd_hidden': d_h, 'dropout': drop, 'n_heads': 4,
+                   'dim_feedforward': d_ff}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
                   'max_epochs': 200, 'patience': 10}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,

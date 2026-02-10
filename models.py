@@ -12,7 +12,8 @@ class ChannelAttentionEEGNet(nn.Module):
     Output: (logits (B, n_classes), alpha (B, C))
     """
 
-    def __init__(self, n_bands=5, n_classes=4, d_hidden=64, dropout=0.5):
+    def __init__(self, n_bands=5, n_classes=4, d_hidden=64, dropout=0.5,
+                 n_heads=4, dim_feedforward=128):
         super().__init__()
         self.spectral_encoder = nn.Sequential(
             nn.Linear(n_bands, d_hidden),
@@ -21,6 +22,15 @@ class ChannelAttentionEEGNet(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_hidden, d_hidden),
             nn.GELU(),
+        )
+        self.channel_interaction = nn.TransformerEncoderLayer(
+            d_model=d_hidden,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
         )
         self.attn_scorer = nn.Sequential(
             nn.Linear(d_hidden, d_hidden // 2),
@@ -37,6 +47,13 @@ class ChannelAttentionEEGNet(nn.Module):
 
     def forward(self, x, channel_mask=None):
         h = self.spectral_encoder(x)               # (B, C, d_hidden)
+        # Cross-channel interaction via self-attention
+        if channel_mask is not None:
+            padding_mask = (channel_mask == 0)      # True = IGNORE (PyTorch convention)
+        else:
+            padding_mask = None
+        h = self.channel_interaction(h, src_key_padding_mask=padding_mask)
+        # Bahdanau attention pooling
         e = self.attn_scorer(h).squeeze(-1)         # (B, C)
         if channel_mask is not None:
             e = e.masked_fill(channel_mask == 0, float('-inf'))
