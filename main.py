@@ -270,6 +270,58 @@ def _eval_all_subjects(models, data, mask, device):
     return accs
 
 
+def _retrain_all_subjects(data, channel_indices, model_kwargs, train_kwargs, device):
+    """Retrain fresh models using only selected channels. Returns list of 15 accuracies."""
+    n_ch = len(channel_indices)
+    ch_idx = list(channel_indices)
+    mk = {**model_kwargs, 'n_channels': n_ch}
+    accs = []
+    for subj in range(1, N_SUBJECTS + 1):
+        X_train_full = np.concatenate([data[subj][1][0][:, ch_idx, :],
+                                        data[subj][2][0][:, ch_idx, :]])
+        y_train_full = np.concatenate([data[subj][1][1], data[subj][2][1]])
+        groups_full = np.concatenate([data[subj][1][2],
+                                      data[subj][2][2] + 24])
+        X_test = data[subj][3][0][:, ch_idx, :]
+        y_test = data[subj][3][1]
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        tr_idx, va_idx = next(gss.split(X_train_full, y_train_full,
+                                         groups=groups_full))
+        X_tr, X_va = X_train_full[tr_idx], X_train_full[va_idx]
+        y_tr, y_va = y_train_full[tr_idx], y_train_full[va_idx]
+        tr_loader = DataLoader(
+            TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr)),
+            batch_size=train_kwargs['batch_size'], shuffle=True)
+        va_loader = DataLoader(
+            TensorDataset(torch.tensor(X_va), torch.tensor(y_va)),
+            batch_size=512, shuffle=False)
+        te_loader = DataLoader(
+            TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
+            batch_size=512, shuffle=False)
+        model = ChannelAttentionEEGNet(**mk).to(device)
+        optimizer = torch.optim.Adam(model.parameters(),
+                                     lr=train_kwargs['lr'],
+                                     weight_decay=train_kwargs['wd'])
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        best_val_acc = 0.0
+        best_state = None
+        patience_counter = 0
+        for epoch in range(train_kwargs['max_epochs']):
+            train_one_epoch(model, tr_loader, optimizer, criterion, device)
+            val_acc = evaluate(model, va_loader, device)
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= train_kwargs['patience']:
+                    break
+        model.load_state_dict(best_state)
+        accs.append(evaluate(model, te_loader, device))
+    return accs
+
+
 def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
     """Run all ablation experiments. Returns dict of results."""
     all_results = {}
@@ -357,27 +409,135 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
     return all_results
 
 
+def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
+                               device='cuda'):
+    """Retrain-from-scratch ablation: fresh model per config. Returns dict of results."""
+    all_results = {}
+    all_ch = set(range(N_CHANNELS))
+
+    # Region keep-only and remove
+    region_configs = []
+    for region_name, indices in REGIONS_FINE.items():
+        region_configs.append((f'keep_only_{region_name}', indices))
+        remaining = sorted(all_ch - set(indices))
+        region_configs.append((f'remove_{region_name}', remaining))
+    region_bar = tqdm(region_configs, desc='  Retrain regions')
+    for config_name, indices in region_bar:
+        accs = _retrain_all_subjects(data, indices, model_kwargs, train_kwargs,
+                                      device)
+        all_results[config_name] = {
+            'n_channels': len(indices),
+            'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
+            'per_subj': accs,
+        }
+        region_bar.set_postfix(config=config_name, acc=f'{np.mean(accs):.4f}')
+
+    # Hemisphere experiments
+    hemi_bar = tqdm(HEMISPHERES.items(), desc='  Retrain hemispheres')
+    for hemi_name, indices in hemi_bar:
+        accs = _retrain_all_subjects(data, indices, model_kwargs, train_kwargs,
+                                      device)
+        all_results[f'hemisphere_{hemi_name}'] = {
+            'n_channels': len(indices),
+            'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
+            'per_subj': accs,
+        }
+        hemi_bar.set_postfix(hemi=hemi_name, acc=f'{np.mean(accs):.4f}')
+
+    # Standard montage subsets
+    montages = {
+        'full_62': list(range(N_CHANNELS)),
+        'standard_1020_19': STANDARD_1020,
+        'emotiv_epoc_14': EMOTIV_EPOC,
+        'muse_approx_4': MUSE_APPROX,
+    }
+    mont_bar = tqdm(montages.items(), desc='  Retrain montages')
+    for mont_name, indices in mont_bar:
+        accs = _retrain_all_subjects(data, indices, model_kwargs, train_kwargs,
+                                      device)
+        all_results[f'montage_{mont_name}'] = {
+            'n_channels': len(indices),
+            'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
+            'per_subj': accs,
+        }
+        mont_bar.set_postfix(montage=mont_name, acc=f'{np.mean(accs):.4f}')
+
+    # Progressive attention-guided (fewer steps to manage cost)
+    n_keep_steps = [62, 50, 40, 30, 20, 10, 5, 1]
+    for strategy_name, ranking in [
+        ('attn_least_first', grand_ranking),
+        ('attn_most_first', grand_ranking[::-1]),
+    ]:
+        curve = {}
+        step_bar = tqdm(n_keep_steps, desc=f'  Retrain {strategy_name}')
+        for n_keep in step_bar:
+            keep = ranking[:n_keep].tolist()
+            accs = _retrain_all_subjects(data, keep, model_kwargs, train_kwargs,
+                                          device)
+            curve[n_keep] = {'mean': float(np.mean(accs)),
+                             'std': float(np.std(accs))}
+            step_bar.set_postfix(n_keep=n_keep, acc=f'{np.mean(accs):.4f}')
+        all_results[f'progressive_{strategy_name}'] = curve
+        print(f"  Progressive retrain {strategy_name}: done")
+
+    # Progressive random (5 seeds × 8 levels)
+    curve_random = {}
+    rand_bar = tqdm(n_keep_steps, desc='  Retrain random')
+    for n_keep in rand_bar:
+        subj_means = np.zeros(N_SUBJECTS)
+        for seed in range(5):
+            rng = np.random.RandomState(seed)
+            keep = rng.choice(N_CHANNELS, n_keep, replace=False).tolist()
+            accs = _retrain_all_subjects(data, keep, model_kwargs, train_kwargs,
+                                          device)
+            subj_means += np.array(accs)
+        subj_means /= 5
+        curve_random[n_keep] = {
+            'mean': float(np.mean(subj_means)),
+            'std': float(np.std(subj_means)),
+        }
+        rand_bar.set_postfix(n_keep=n_keep, acc=f'{np.mean(subj_means):.4f}')
+    all_results['progressive_random'] = curve_random
+    print("  Progressive retrain random: done")
+
+    return all_results
+
+
 # ────────────────────────────────────────────────────────────────────
 # Visualization (Phase 5)
 # ────────────────────────────────────────────────────────────────────
 
-def plot_progressive_ablation_curves(results):
+def plot_progressive_ablation_curves(results, retrain_results=None):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
     curves_to_plot = [
-        ('progressive_attn_least_first', '#2ecc71', 'ChannelAttn (least first)', '-', 'o'),
-        ('progressive_random',           '#95a5a6', 'ChannelAttn random',        '-', 'o'),
-        ('progressive_attn_most_first',  '#e74c3c', 'ChannelAttn (most first)',  '-', 'o'),
+        ('progressive_attn_least_first', '#2ecc71', 'Mask (least first)', '-', 'o'),
+        ('progressive_random',           '#95a5a6', 'Mask random',        '-', 'o'),
+        ('progressive_attn_most_first',  '#e74c3c', 'Mask (most first)',  '-', 'o'),
     ]
+    if retrain_results is not None:
+        curves_to_plot.extend([
+            ('retrain_progressive_attn_least_first', '#2ecc71', 'Retrain (least first)', '--', '^'),
+            ('retrain_progressive_random',           '#95a5a6', 'Retrain random',        '--', '^'),
+            ('retrain_progressive_attn_most_first',  '#e74c3c', 'Retrain (most first)',  '--', '^'),
+        ])
     if 'dual_progressive_attn_least_first' in results:
         curves_to_plot.extend([
             ('dual_progressive_attn_least_first', '#2ecc71', 'DualAttn (least first)', '--', 's'),
             ('dual_progressive_random',           '#95a5a6', 'DualAttn random',        '--', 's'),
             ('dual_progressive_attn_most_first',  '#e74c3c', 'DualAttn (most first)',  '--', 's'),
         ])
+    # Merge retrain curves into a combined dict for lookup
+    _all_curves = dict(results)
+    if retrain_results is not None:
+        for k, v in retrain_results.items():
+            if k.startswith('progressive_'):
+                _all_curves[f'retrain_{k}'] = v
     for key, color, label, ls, marker in curves_to_plot:
-        curve = results[key]
+        if key not in _all_curves:
+            continue
+        curve = _all_curves[key]
         n_ch = sorted(curve.keys(), key=int)
         x_vals = [int(n) for n in n_ch]
         means = [curve[n]['mean'] for n in n_ch]
@@ -496,6 +656,39 @@ def plot_per_emotion_topomap(emotion_importances):
     plt.close()
 
 
+def plot_retrain_comparison(mask_results, retrain_results):
+    """Grouped bar chart: mask-based vs retrain accuracy for montage subsets."""
+    import matplotlib.pyplot as plt
+
+    montage_keys = ['montage_full_62', 'montage_standard_1020_19',
+                    'montage_emotiv_epoc_14', 'montage_muse_approx_4']
+    labels = ['62ch (full)', '19ch (10-20)', '14ch (EPOC)', '4ch (Muse)']
+    mask_means = [mask_results[k]['mean'] for k in montage_keys]
+    mask_stds = [mask_results[k]['std'] for k in montage_keys]
+    retrain_means = [retrain_results[k]['mean'] for k in montage_keys]
+    retrain_stds = [retrain_results[k]['std'] for k in montage_keys]
+
+    x = np.arange(len(labels))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(x - width / 2, mask_means, width, yerr=mask_stds, capsize=4,
+           label='Mask-based', color='#3498db', alpha=0.85)
+    ax.bar(x + width / 2, retrain_means, width, yerr=retrain_stds, capsize=4,
+           label='Retrain from scratch', color='#e67e22', alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel('Accuracy')
+    ax.set_title('Mask-Based vs Retrain-from-Scratch Ablation')
+    ax.legend()
+    ax.axhline(y=0.25, color='black', linestyle=':', alpha=0.5)
+    ax.set_ylim(0.15, 0.75)
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig('retrain_comparison.pdf', dpi=300, bbox_inches='tight')
+    print("Saved retrain_comparison.pdf")
+    plt.close()
+
+
 # ────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ────────────────────────────────────────────────────────────────────
@@ -510,6 +703,8 @@ if __name__ == '__main__':
                         help='Skip HP search, use defaults')
     parser.add_argument('--notebook', action='store_true',
                         help='Use tqdm.notebook for Colab/Jupyter')
+    parser.add_argument('--retrain_ablation', action='store_true',
+                        help='Run retrain-from-scratch ablation (expensive)')
     args = parser.parse_args()
 
     if args.notebook:
@@ -562,7 +757,7 @@ if __name__ == '__main__':
         best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
                              'd_hidden': 64, 'dropout': 0.3, 'n_heads': 4,
                              'dim_feedforward': 128}
-        best_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
+        best_train_kwargs = {'lr': 5e-4, 'wd': 1e-3, 'batch_size': 128,
                              'max_epochs': 200, 'patience': 10}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
                            'h1': 128, 'h2': 64, 'dropout': 0.5}
@@ -665,9 +860,16 @@ if __name__ == '__main__':
     ablation_results = run_full_ablation_study(
         attn_models, data, grand_ranking, device)
 
+    # ── Phase 4b: Retrain-from-scratch ablation (optional) ──
+    retrain_ablation_results = None
+    if args.retrain_ablation:
+        print("\n=== Phase 4b: Retrain-from-scratch ablation ===")
+        retrain_ablation_results = run_retrain_ablation_study(
+            data, grand_ranking, best_model_kwargs, best_train_kwargs, device)
+
     # ── Phase 5: Visualization & statistics ──
     print("\n=== Phase 5: Visualization ===")
-    plot_progressive_ablation_curves(ablation_results)
+    plot_progressive_ablation_curves(ablation_results, retrain_ablation_results)
     plot_topographic_attention(grand_importance)
     plot_region_ablation_table(ablation_results)
 
@@ -685,6 +887,9 @@ if __name__ == '__main__':
     for c in grand_emotion_imp:
         grand_emotion_imp[c] /= N_SUBJECTS
     plot_per_emotion_topomap(grand_emotion_imp)
+
+    if retrain_ablation_results is not None:
+        plot_retrain_comparison(ablation_results, retrain_ablation_results)
 
     # Wilcoxon signed-rank tests with Holm-Bonferroni correction
     print("\n=== Statistical tests (Wilcoxon, Holm-Bonferroni corrected) ===")
@@ -732,6 +937,8 @@ if __name__ == '__main__':
         'best_mlp_kwargs': best_mlp_kwargs,
         'best_mlp_train_kwargs': best_mlp_train_kwargs,
     }
+    if retrain_ablation_results is not None:
+        save_results['ablation_retrain'] = retrain_ablation_results
     with open('results.json', 'w') as f:
         json.dump(save_results, f, indent=2)
     print("\nSaved results.json")
