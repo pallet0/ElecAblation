@@ -261,8 +261,9 @@ def permutation_importance(model, X, y, device, n_repeats=10):
     model.eval()
     X_t = torch.tensor(X, dtype=torch.float32, device=device)
     y_t = torch.tensor(y, dtype=torch.long, device=device)
+    N = X_t.size(0)
     # Baseline accuracy
-    logits = model(X_t.view(X_t.size(0), -1))
+    logits = model(X_t.reshape(N, -1))
     baseline_acc = (logits.argmax(1) == y_t).float().mean().item()
     n_channels = X.shape[1]
     importances = np.zeros(n_channels)
@@ -270,9 +271,9 @@ def permutation_importance(model, X, y, device, n_repeats=10):
         shuffled_accs = []
         for _ in range(n_repeats):
             X_perm = X_t.clone()
-            perm_idx = torch.randperm(X_perm.size(0), device=device)
+            perm_idx = torch.randperm(N, device=device)
             X_perm[:, ch, :] = X_perm[perm_idx, ch, :]
-            logits = model(X_perm.view(X_perm.size(0), -1))
+            logits = model(X_perm.reshape(N, -1))
             acc = (logits.argmax(1) == y_t).float().mean().item()
             shuffled_accs.append(acc)
         importances[ch] = baseline_acc - float(np.mean(shuffled_accs))
