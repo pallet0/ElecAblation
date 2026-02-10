@@ -778,7 +778,7 @@ if __name__ == '__main__':
         best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
                              'd_hidden': 64, 'dropout': 0.3}
         best_train_kwargs = {'lr': 5e-4, 'wd': 1e-3, 'batch_size': 128,
-                             'max_epochs': 200, 'patience': 10,
+                             'max_epochs': 200, 'patience': 20,
                              'mixup_alpha': 0.2}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
                            'h1': 128, 'h2': 64, 'dropout': 0.5}
@@ -809,7 +809,7 @@ if __name__ == '__main__':
             mk = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
                    'd_hidden': d_h, 'dropout': drop}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
-                  'max_epochs': 200, 'patience': 10,
+                  'max_epochs': 200, 'patience': 20,
                   'mixup_alpha': mix_a}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                ChannelAttentionEEGNet, mk, tk,
