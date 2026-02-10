@@ -533,7 +533,7 @@ if __name__ == '__main__':
     # ── Phase 1: Hyperparameter search ──
     if args.skip_search:
         best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
-                             'd_hidden': 128, 'dropout': 0.5}
+                             'd_hidden': 32, 'dropout': 0.5}
         best_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
                              'max_epochs': 200, 'patience': 15}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
@@ -544,7 +544,7 @@ if __name__ == '__main__':
     else:
         print("\n=== Phase 1a: Attention HP search (5-fold CV) ===")
         search_space = {
-            'd_hidden': [64, 128],
+            'd_hidden': [32, 64],
             'dropout':  [0.3, 0.5],
             'lr':       [1e-3, 5e-4, 1e-4],
             'wd':       [1e-5, 1e-4],
