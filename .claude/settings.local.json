@@ -25,7 +25,9 @@
       "mcp__plugin_serena_serena__think_about_task_adherence",
       "mcp__plugin_serena_serena__replace_symbol_body",
       "mcp__plugin_serena_serena__replace_content",
-      "mcp__plugin_serena_serena__think_about_whether_you_are_done"
+      "mcp__plugin_serena_serena__think_about_whether_you_are_done",
+      "mcp__plugin_serena_serena__insert_after_symbol",
+      "mcp__plugin_serena_serena__execute_shell_command"
     ]
   }
 }

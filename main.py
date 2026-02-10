@@ -10,7 +10,7 @@ import numpy as np
 import scipy.io as sio
 import torch
 import torch.nn as nn
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+from sklearn.model_selection import GroupKFold
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm  # rebind to tqdm.notebook below if --notebook
 
@@ -155,6 +155,8 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
         optimizer = torch.optim.Adam(model.parameters(),
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=train_kwargs['max_epochs'])
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         best_val_acc = 0.0
         best_state = None
@@ -166,7 +168,53 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
                                            channel_drop_rate=channel_drop_rate,
                                            mixup_alpha=mixup_alpha)
             val_acc = evaluate(model, va_loader, device)
+            scheduler.step()
             fold_bar.set_postfix(fold=f'{fold+1}/{k}', epoch=epoch,
+                                 train=f'{train_acc:.4f}', val=f'{val_acc:.4f}',
+                                 best=f'{best_val_acc:.4f}')
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= train_kwargs['patience']:
+                    break
+        model.load_state_dict(best_state)
+        fold_accs.append(evaluate(model, va_loader, device))
+    fold_bar.close()
+    return float(np.mean(fold_accs)), float(np.std(fold_accs))
+
+
+def cross_session_validate(data, model_cls, model_kwargs, train_kwargs, device='cuda'):
+    """2-fold cross-session CV: train sess1/val sess2, then swap. Returns (mean_acc, std_acc)."""
+    fold_accs = []
+    fold_bar = tqdm([(1, 2), (2, 1)], desc='    Folds', leave=False)
+    for fold, (train_sess, val_sess) in enumerate(fold_bar):
+        X_tr = np.concatenate([data[s][train_sess][0] for s in range(1, N_SUBJECTS + 1)])
+        y_tr = np.concatenate([data[s][train_sess][1] for s in range(1, N_SUBJECTS + 1)])
+        X_va = np.concatenate([data[s][val_sess][0] for s in range(1, N_SUBJECTS + 1)])
+        y_va = np.concatenate([data[s][val_sess][1] for s in range(1, N_SUBJECTS + 1)])
+        tr_loader = DataLoader(TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr)),
+                               batch_size=train_kwargs['batch_size'], shuffle=True)
+        va_loader = DataLoader(TensorDataset(torch.tensor(X_va), torch.tensor(y_va)),
+                               batch_size=512, shuffle=False)
+        model = model_cls(**model_kwargs).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=train_kwargs['lr'],
+                                     weight_decay=train_kwargs['wd'])
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=train_kwargs['max_epochs'])
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        best_val_acc = 0.0
+        best_state = None
+        patience_counter = 0
+        mixup_alpha = train_kwargs.get('mixup_alpha', 0.0)
+        for epoch in range(train_kwargs['max_epochs']):
+            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device,
+                                           mixup_alpha=mixup_alpha)
+            val_acc = evaluate(model, va_loader, device)
+            scheduler.step()
+            fold_bar.set_postfix(fold=f'{fold+1}/2', epoch=epoch,
                                  train=f'{train_acc:.4f}', val=f'{val_acc:.4f}',
                                  best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
@@ -188,7 +236,7 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
 # ────────────────────────────────────────────────────────────────────
 
 def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda'):
-    """Per-subject: train on sessions 1+2, test on session 3 with early stopping.
+    """Per-subject: train on session 1, val on session 2 (cross-session), test on session 3.
 
     Returns: (per_subject_accs dict, trained_models dict)
     """
@@ -196,17 +244,9 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
     models = {}
     subj_bar = tqdm(range(1, N_SUBJECTS + 1), desc='Subjects')
     for subj in subj_bar:
-        X_train_full = np.concatenate([data[subj][1][0], data[subj][2][0]])
-        y_train_full = np.concatenate([data[subj][1][1], data[subj][2][1]])
-        # Trial IDs with offset so session 2 trials are unique from session 1
-        groups_full = np.concatenate([data[subj][1][2],
-                                      data[subj][2][2] + 24])
+        X_tr, y_tr, _ = data[subj][1]    # Session 1 = training
+        X_va, y_va, _ = data[subj][2]    # Session 2 = cross-session validation
         X_test, y_test, _ = data[subj][3]
-        # Trial-level train/val split for early stopping (no temporal leakage)
-        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-        tr_idx, va_idx = next(gss.split(X_train_full, y_train_full, groups=groups_full))
-        X_tr, X_va = X_train_full[tr_idx], X_train_full[va_idx]
-        y_tr, y_va = y_train_full[tr_idx], y_train_full[va_idx]
         tr_loader = DataLoader(
             TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr)),
             batch_size=train_kwargs['batch_size'], shuffle=True)
@@ -220,6 +260,8 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
         optimizer = torch.optim.Adam(model.parameters(),
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=train_kwargs['max_epochs'])
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         best_val_acc = 0.0
         best_state = None
@@ -233,6 +275,7 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
                                            channel_drop_rate=channel_drop_rate,
                                            mixup_alpha=mixup_alpha)
             val_acc = evaluate(model, va_loader, device)
+            scheduler.step()
             epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
@@ -298,18 +341,12 @@ def _retrain_all_subjects(data, channel_indices, model_kwargs, train_kwargs, dev
     mk = {**model_kwargs, 'n_channels': n_ch}
     accs = []
     for subj in range(1, N_SUBJECTS + 1):
-        X_train_full = np.concatenate([data[subj][1][0][:, ch_idx, :],
-                                        data[subj][2][0][:, ch_idx, :]])
-        y_train_full = np.concatenate([data[subj][1][1], data[subj][2][1]])
-        groups_full = np.concatenate([data[subj][1][2],
-                                      data[subj][2][2] + 24])
+        X_tr = data[subj][1][0][:, ch_idx, :]   # Session 1, selected channels
+        y_tr = data[subj][1][1]
+        X_va = data[subj][2][0][:, ch_idx, :]   # Session 2, selected channels
+        y_va = data[subj][2][1]
         X_test = data[subj][3][0][:, ch_idx, :]
         y_test = data[subj][3][1]
-        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-        tr_idx, va_idx = next(gss.split(X_train_full, y_train_full,
-                                         groups=groups_full))
-        X_tr, X_va = X_train_full[tr_idx], X_train_full[va_idx]
-        y_tr, y_va = y_train_full[tr_idx], y_train_full[va_idx]
         tr_loader = DataLoader(
             TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr)),
             batch_size=train_kwargs['batch_size'], shuffle=True)
@@ -323,6 +360,8 @@ def _retrain_all_subjects(data, channel_indices, model_kwargs, train_kwargs, dev
         optimizer = torch.optim.Adam(model.parameters(),
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=train_kwargs['max_epochs'])
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         best_val_acc = 0.0
         best_state = None
@@ -330,6 +369,7 @@ def _retrain_all_subjects(data, channel_indices, model_kwargs, train_kwargs, dev
         for epoch in range(train_kwargs['max_epochs']):
             train_one_epoch(model, tr_loader, optimizer, criterion, device)
             val_acc = evaluate(model, va_loader, device)
+            scheduler.step()
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_state = copy.deepcopy(model.state_dict())
@@ -761,17 +801,7 @@ if __name__ == '__main__':
         sizes = [data[subj][s][0].shape[0] for s in range(1, N_SESSIONS + 1)]
         print(f"  Subject {subj:2d}: {sizes} samples per session")
 
-    # Pool sessions 1+2 for HP search (trial IDs offset to be globally unique)
-    X_pool = np.concatenate([data[s][sess][0]
-                             for s in range(1, N_SUBJECTS + 1)
-                             for sess in [1, 2]])
-    y_pool = np.concatenate([data[s][sess][1]
-                             for s in range(1, N_SUBJECTS + 1)
-                             for sess in [1, 2]])
-    trial_pool = np.concatenate([data[s][sess][2] + s * 1000 + sess * 100
-                                 for s in range(1, N_SUBJECTS + 1)
-                                 for sess in [1, 2]])
-    print(f"  Pooled shape: {X_pool.shape}, labels: {np.bincount(y_pool)}")
+    # (Data is already organized by subject/session — no pooling needed for cross-session CV)
 
     # ── Phase 1: Hyperparameter search ──
     if args.skip_search:
@@ -786,7 +816,7 @@ if __name__ == '__main__':
                                  'max_epochs': 200, 'patience': 10}
         print("\n=== Phase 1: Skipped (using defaults) ===")
     else:
-        print("\n=== Phase 1a: Attention HP search (5-fold CV) ===")
+        print("\n=== Phase 1a: Attention HP search (2-fold cross-session CV) ===")
         search_space = {
             'd_hidden': [64],
             'dropout':  [0.3, 0.5],
@@ -811,9 +841,8 @@ if __name__ == '__main__':
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
                   'max_epochs': 200, 'patience': 20,
                   'mixup_alpha': mix_a}
-            mean_acc, std_acc = cross_validate(X_pool, y_pool,
-                                               ChannelAttentionEEGNet, mk, tk,
-                                               device=device, groups=trial_pool)
+            mean_acc, std_acc = cross_session_validate(
+                data, ChannelAttentionEEGNet, mk, tk, device=device)
             if mean_acc > best_score:
                 best_score = mean_acc
                 best_model_kwargs = mk
@@ -823,7 +852,7 @@ if __name__ == '__main__':
         print(f"Best config: {best_model_kwargs}, {best_train_kwargs}")
 
         # Phase 1b: MLP HP search
-        print("\n=== Phase 1b: MLP HP search (5-fold CV) ===")
+        print("\n=== Phase 1b: MLP HP search (2-fold cross-session CV) ===")
         mlp_search_space = {
             'h1': [128, 256], 'h2': [64],
             'dropout': [0.3, 0.5], 'lr': [5e-4],
@@ -843,9 +872,8 @@ if __name__ == '__main__':
                    'h1': h1, 'h2': h2, 'dropout': drop}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
                   'max_epochs': 200, 'patience': 10}
-            mean_acc, std_acc = cross_validate(X_pool, y_pool,
-                                               MLPBaseline, mk, tk,
-                                               device=device, groups=trial_pool)
+            mean_acc, std_acc = cross_session_validate(
+                data, MLPBaseline, mk, tk, device=device)
             if mean_acc > best_mlp_score:
                 best_mlp_score = mean_acc
                 best_mlp_kwargs = mk
