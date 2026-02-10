@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from torch.utils.data import DataLoader, TensorDataset
-from tqdm.auto import tqdm
+from tqdm.auto import tqdm  # rebind to tqdm.notebook below if --notebook
 
 from config import (
     CHANNEL_NAMES, DATA_ROOT, EMOTIV_EPOC, HEMISPHERES, MNE_NAME_MAP,
@@ -480,7 +480,12 @@ if __name__ == '__main__':
                         help='Device (default: auto-detect)')
     parser.add_argument('--skip_search', action='store_true',
                         help='Skip HP search, use defaults')
+    parser.add_argument('--notebook', action='store_true',
+                        help='Use tqdm.notebook for Colab/Jupyter')
     args = parser.parse_args()
+
+    if args.notebook:
+        from tqdm.notebook import tqdm  # noqa: F811 — rebinds module-level tqdm
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -538,11 +543,11 @@ if __name__ == '__main__':
     else:
         print("\n=== Phase 1a: Attention HP search (5-fold CV) ===")
         search_space = {
-            'd_hidden': [32, 64, 128],
-            'dropout':  [0.3, 0.5, 0.7],
-            'lr':       [1e-3, 5e-4, 1e-4],
-            'wd':       [1e-4, 1e-5],
-            'batch_size': [128, 256],
+            'd_hidden': [32, 64],
+            'dropout':  [0.3, 0.5],
+            'lr':       [5e-4, 1e-4],
+            'wd':       [1e-4],
+            'batch_size': [128],
         }
         best_score = 0.0
         best_model_kwargs = None
@@ -571,9 +576,9 @@ if __name__ == '__main__':
         # Phase 1b: MLP HP search
         print("\n=== Phase 1b: MLP HP search (5-fold CV) ===")
         mlp_search_space = {
-            'h1': [128, 256], 'h2': [32, 64],
-            'dropout': [0.3, 0.5], 'lr': [1e-3, 5e-4],
-            'wd': [1e-4, 1e-5], 'batch_size': [128, 256],
+            'h1': [128, 256], 'h2': [64],
+            'dropout': [0.3, 0.5], 'lr': [5e-4],
+            'wd': [1e-4], 'batch_size': [128],
         }
         best_mlp_score = 0.0
         best_mlp_kwargs = None
