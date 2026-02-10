@@ -17,7 +17,7 @@ N_CLASSES = 4    # 0=neutral, 1=sad, 2=fear, 3=happy
 N_SUBJECTS = 15
 N_SESSIONS = 3
 
-DATA_ROOT = r'SEED_IV\eeg_feature_smooth'
+DATA_ROOT = r'C:\Users\palle\Desktop\QIProject\ResStab_SEED-IV\SEED_IV\eeg_feature_smooth'
 
 # Labels per session (from SEED-IV ReadMe)
 SESSION_LABELS = [

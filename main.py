@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 from config import (
     CHANNEL_NAMES, DATA_ROOT, EMOTIV_EPOC, HEMISPHERES, MNE_NAME_MAP,
@@ -138,7 +139,6 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
                     break
         model.load_state_dict(best_state)
         fold_accs.append(evaluate(model, va_loader, device))
-        print(f"  Fold {fold+1}: {best_val_acc:.4f}")
     return float(np.mean(fold_accs)), float(np.std(fold_accs))
 
 
@@ -153,7 +153,8 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
     """
     results = {}
     models = {}
-    for subj in range(1, N_SUBJECTS + 1):
+    subj_bar = tqdm(range(1, N_SUBJECTS + 1), desc='Subjects')
+    for subj in subj_bar:
         X_train_full = np.concatenate([data[subj][1][0], data[subj][2][0]])
         y_train_full = np.concatenate([data[subj][1][1], data[subj][2][1]])
         X_test, y_test = data[subj][3]
@@ -178,9 +179,12 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
         best_val_acc = 0.0
         best_state = None
         patience_counter = 0
-        for epoch in range(train_kwargs['max_epochs']):
+        epoch_bar = tqdm(range(train_kwargs['max_epochs']),
+                         desc=f'  S{subj:02d} epochs', leave=False)
+        for epoch in epoch_bar:
             train_one_epoch(model, tr_loader, optimizer, criterion, device)
             val_acc = evaluate(model, va_loader, device)
+            epoch_bar.set_postfix(val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_state = copy.deepcopy(model.state_dict())
@@ -189,11 +193,13 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
                 patience_counter += 1
                 if patience_counter >= train_kwargs['patience']:
                     break
+        epoch_bar.close()
         model.load_state_dict(best_state)
         test_acc = evaluate(model, te_loader, device)
         results[subj] = test_acc
         models[subj] = model
-        print(f"  Subject {subj:2d}: val={best_val_acc:.4f}  test={test_acc:.4f}")
+        subj_bar.set_postfix(last_test=f'{test_acc:.4f}')
+        tqdm.write(f"  Subject {subj:2d}: val={best_val_acc:.4f}  test={test_acc:.4f}")
     accs = list(results.values())
     print(f"  Mean: {np.mean(accs):.4f} +/- {np.std(accs):.4f}")
     return results, models
@@ -527,11 +533,12 @@ if __name__ == '__main__':
         best_score = 0.0
         best_model_kwargs = None
         best_train_kwargs = None
-        for d_h, drop, lr, wd, bs in itertools.product(
+        configs_1a = list(itertools.product(
             search_space['d_hidden'], search_space['dropout'],
             search_space['lr'], search_space['wd'], search_space['batch_size'],
-        ):
-            print(f"Config: d={d_h}, drop={drop}, lr={lr}, wd={wd}, bs={bs}")
+        ))
+        pbar_1a = tqdm(configs_1a, desc='Attention HP search')
+        for d_h, drop, lr, wd, bs in pbar_1a:
             mk = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
                    'd_hidden': d_h, 'dropout': drop}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
@@ -539,11 +546,11 @@ if __name__ == '__main__':
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                ChannelAttentionEEGNet, mk, tk,
                                                device=device)
-            print(f"  -> CV Acc: {mean_acc:.4f} +/- {std_acc:.4f}\n")
             if mean_acc > best_score:
                 best_score = mean_acc
                 best_model_kwargs = mk
                 best_train_kwargs = tk
+            pbar_1a.set_postfix(best=f'{best_score:.4f}', last=f'{mean_acc:.4f}')
         print(f"Best CV Acc: {best_score:.4f}")
         print(f"Best config: {best_model_kwargs}, {best_train_kwargs}")
 
@@ -557,12 +564,13 @@ if __name__ == '__main__':
         best_mlp_score = 0.0
         best_mlp_kwargs = None
         best_mlp_train_kwargs = None
-        for h1, h2, drop, lr, wd, bs in itertools.product(
+        configs_1b = list(itertools.product(
             mlp_search_space['h1'], mlp_search_space['h2'],
             mlp_search_space['dropout'], mlp_search_space['lr'],
             mlp_search_space['wd'], mlp_search_space['batch_size'],
-        ):
-            print(f"MLP Config: h1={h1}, h2={h2}, drop={drop}, lr={lr}, wd={wd}, bs={bs}")
+        ))
+        pbar_1b = tqdm(configs_1b, desc='MLP HP search')
+        for h1, h2, drop, lr, wd, bs in pbar_1b:
             mk = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
                    'h1': h1, 'h2': h2, 'dropout': drop}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
@@ -570,11 +578,11 @@ if __name__ == '__main__':
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                MLPBaseline, mk, tk,
                                                device=device)
-            print(f"  -> CV Acc: {mean_acc:.4f} +/- {std_acc:.4f}\n")
             if mean_acc > best_mlp_score:
                 best_mlp_score = mean_acc
                 best_mlp_kwargs = mk
                 best_mlp_train_kwargs = tk
+            pbar_1b.set_postfix(best=f'{best_mlp_score:.4f}', last=f'{mean_acc:.4f}')
         print(f"Best MLP CV Acc: {best_mlp_score:.4f}")
         print(f"Best MLP config: {best_mlp_kwargs}, {best_mlp_train_kwargs}")
 
