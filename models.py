@@ -19,16 +19,19 @@ class ChannelAttentionEEGNet(nn.Module):
             nn.LayerNorm(d_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(d_hidden, d_hidden),
+            nn.GELU(),
         )
         self.attn_scorer = nn.Sequential(
             nn.Linear(d_hidden, d_hidden // 2),
             nn.Tanh(),
-            nn.Dropout(dropout),
             nn.Linear(d_hidden // 2, 1, bias=False),
         )
         self.classifier = nn.Sequential(
             nn.LayerNorm(d_hidden),
             nn.Dropout(dropout),
+            nn.Linear(d_hidden, d_hidden),
+            nn.GELU(),
             nn.Linear(d_hidden, n_classes),
         )
 

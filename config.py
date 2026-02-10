@@ -55,5 +55,7 @@ MUSE_APPROX   = [3,4,32,40]
 # ── MNE name mapping for topographic plotting ──
 MNE_NAME_MAP = {
     'FP1': 'Fp1', 'FPZ': 'Fpz', 'FP2': 'Fp2',
+    'FZ': 'Fz', 'FCZ': 'FCz', 'CZ': 'Cz', 'CPZ': 'CPz',
+    'PZ': 'Pz', 'POZ': 'POz', 'OZ': 'Oz',
     'CB1': 'PO9', 'CB2': 'PO10',
 }
