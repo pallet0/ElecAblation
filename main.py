@@ -127,8 +127,6 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=5)
         best_val_acc = 0.0
         best_state = None
         patience_counter = 0
@@ -137,7 +135,6 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
         for epoch in epoch_bar:
             _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device)
             val_acc = evaluate(model, va_loader, device)
-            scheduler.step(val_acc)
             epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
@@ -191,8 +188,6 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=5)
         best_val_acc = 0.0
         best_state = None
         patience_counter = 0
@@ -201,7 +196,6 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
         for epoch in epoch_bar:
             _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device)
             val_acc = evaluate(model, va_loader, device)
-            scheduler.step(val_acc)
             epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
