@@ -27,7 +27,8 @@
       "mcp__plugin_serena_serena__replace_content",
       "mcp__plugin_serena_serena__think_about_whether_you_are_done",
       "mcp__plugin_serena_serena__insert_after_symbol",
-      "mcp__plugin_serena_serena__execute_shell_command"
+      "mcp__plugin_serena_serena__execute_shell_command",
+      "mcp__plugin_serena_serena__read_memory"
     ]
   }
 }

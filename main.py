@@ -294,6 +294,48 @@ def per_emotion_permutation_importance(model, X, y, device,
     return result
 
 
+def integrated_gradients_importance(model, X, y, device, n_steps=50,
+                                    batch_size=256):
+    """Compute Integrated Gradients channel importance.
+
+    Args:
+        model: trained MLPBaseline
+        X: numpy array (N, 62, 5)
+        y: numpy array (N,)
+        device: torch device
+        n_steps: interpolation steps (default 50)
+        batch_size: batch size for forward/backward passes
+    Returns: (62,) array — per-channel importance (positive = important)
+    """
+    model.eval()
+    X_t = torch.tensor(X, dtype=torch.float32, device=device)  # (N, 62, 5)
+    y_t = torch.tensor(y, dtype=torch.long, device=device)
+    N, C, B = X_t.shape  # N samples, 62 channels, 5 bands
+    flat_dim = C * B  # 310
+
+    accum = torch.zeros(N, flat_dim, device=device)
+
+    for step in range(1, n_steps + 1):
+        alpha = step / n_steps
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            x_interp = (alpha * X_t[start:end]).reshape(end - start, flat_dim)
+            x_interp.requires_grad_(True)
+            logits = model(x_interp)
+            target_logits = logits.gather(1, y_t[start:end].unsqueeze(1)).squeeze(1)
+            target_logits.sum().backward()
+            accum[start:end] += x_interp.grad.detach()
+
+    # IG = (input - baseline) * avg_grad; baseline=0 → input * avg_grad
+    avg_grad = accum / n_steps  # (N, 310)
+    ig = X_t.reshape(N, flat_dim) * avg_grad  # (N, 310)
+
+    # Per-channel: reshape to (N, 62, 5), sum |IG| over bands, mean over samples
+    ig = ig.reshape(N, C, B)
+    channel_importance = ig.abs().sum(dim=2).mean(dim=0)  # (62,)
+    return channel_importance.cpu().numpy()
+
+
 # ────────────────────────────────────────────────────────────────────
 # Ablation study (Phase 4)
 # ────────────────────────────────────────────────────────────────────
@@ -420,7 +462,7 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
         }
         print(f"  Montage {mont_name}: {np.mean(accs):.4f}")
 
-    # Progressive ablation (attention-guided: least first, most first)
+    # Progressive ablation (PI-guided: least first, most first)
     n_keep_steps = [62, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 8, 5, 3, 1]
     for strategy_name, ranking in [
         ('pi_least_first', grand_ranking),
@@ -852,6 +894,19 @@ if __name__ == '__main__':
     grand_ranking = grand_importance.argsort()[::-1].copy()
     print("  Top-10 channels:", [CHANNEL_NAMES[i] for i in grand_ranking[:10]])
 
+    # ── Phase 3b: Integrated Gradients importance ──
+    print("\n=== Phase 3b: Integrated Gradients importance ===")
+    ig_importances = np.zeros((N_SUBJECTS, N_CHANNELS))
+    ig_bar = tqdm(range(1, N_SUBJECTS + 1), desc='IG subjects')
+    for subj in ig_bar:
+        X_test, y_test, _ = data[subj][3]
+        ig_importances[subj - 1] = integrated_gradients_importance(
+            mlp_models[subj], X_test, y_test, device, n_steps=50)
+        ig_bar.set_postfix(subj=subj)
+    grand_ig_importance = ig_importances.mean(axis=0)
+    grand_ig_ranking = grand_ig_importance.argsort()[::-1].copy()
+    print("  IG Top-10 channels:", [CHANNEL_NAMES[i] for i in grand_ig_ranking[:10]])
+
     # ── Phase 4: Full ablation study ──
     print("\n=== Phase 4: Ablation study ===")
     ablation_results = run_full_ablation_study(
@@ -868,6 +923,9 @@ if __name__ == '__main__':
     print("\n=== Phase 5: Visualization ===")
     plot_progressive_ablation_curves(ablation_results, retrain_ablation_results)
     plot_topographic_importance(grand_importance)
+    plot_topographic_importance(grand_ig_importance,
+                                title='Integrated Gradients Importance (Grand Average)',
+                                filename='topomap_importance_IG.pdf')
     plot_region_ablation_table(ablation_results)
 
     # Per-emotion permutation importance (grand average across subjects)
@@ -926,6 +984,8 @@ if __name__ == '__main__':
         'mlp_mean': float(np.mean(list(mlp_results.values()))),
         'grand_ranking': grand_ranking.tolist(),
         'grand_importance': grand_importance.tolist(),
+        'grand_ig_importance': grand_ig_importance.tolist(),
+        'grand_ig_ranking': grand_ig_ranking.tolist(),
         'ablation': ablation_results,
         'best_mlp_kwargs': best_mlp_kwargs,
         'best_mlp_train_kwargs': best_mlp_train_kwargs,
