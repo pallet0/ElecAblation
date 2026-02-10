@@ -10,7 +10,7 @@ import numpy as np
 import scipy.io as sio
 import torch
 import torch.nn as nn
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
@@ -31,11 +31,11 @@ def load_seed4_session(mat_path, session_idx):
     Args:
         mat_path: path to the .mat file
         session_idx: 0-based session index (for label lookup)
-    Returns: X (n_samples, 62, 5), y (n_samples,)
+    Returns: X (n_samples, 62, 5), y (n_samples,), trial_ids (n_samples,)
     """
     data = sio.loadmat(mat_path)
     labels = SESSION_LABELS[session_idx]
-    X_list, y_list = [], []
+    X_list, y_list, trial_id_list = [], [], []
     for trial_idx in range(24):
         key = f'de_LDS{trial_idx + 1}'
         if key not in data:
@@ -45,9 +45,11 @@ def load_seed4_session(mat_path, session_idx):
         n_t = trial_data.shape[0]
         X_list.append(trial_data)
         y_list.append(np.full(n_t, labels[trial_idx]))
+        trial_id_list.append(np.full(n_t, trial_idx))
     X = np.concatenate(X_list, axis=0).astype(np.float32)
     y = np.concatenate(y_list, axis=0).astype(np.int64)
-    return X, y
+    trial_ids = np.concatenate(trial_id_list, axis=0).astype(np.int64)
+    return X, y, trial_ids
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -105,11 +107,12 @@ def evaluate(model, loader, device, channel_mask=None):
 # Cross-validation (Phase 1)
 # ────────────────────────────────────────────────────────────────────
 
-def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cuda'):
-    """Stratified k-fold CV. Returns (mean_acc, std_acc)."""
-    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
+def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cuda',
+                   groups=None):
+    """Group k-fold CV (trial-level splits). Returns (mean_acc, std_acc)."""
+    gkf = GroupKFold(n_splits=k)
     fold_accs = []
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups=groups)):
         X_tr = torch.tensor(X[train_idx])
         y_tr = torch.tensor(y[train_idx])
         X_va = torch.tensor(X[val_idx])
@@ -161,11 +164,15 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
     for subj in subj_bar:
         X_train_full = np.concatenate([data[subj][1][0], data[subj][2][0]])
         y_train_full = np.concatenate([data[subj][1][1], data[subj][2][1]])
-        X_test, y_test = data[subj][3]
-        # Stratified train/val split for early stopping (no test-set leakage)
-        X_tr, X_va, y_tr, y_va = train_test_split(
-            X_train_full, y_train_full, test_size=0.2,
-            stratify=y_train_full, random_state=42)
+        # Trial IDs with offset so session 2 trials are unique from session 1
+        groups_full = np.concatenate([data[subj][1][2],
+                                      data[subj][2][2] + 24])
+        X_test, y_test, _ = data[subj][3]
+        # Trial-level train/val split for early stopping (no temporal leakage)
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        tr_idx, va_idx = next(gss.split(X_train_full, y_train_full, groups=groups_full))
+        X_tr, X_va = X_train_full[tr_idx], X_train_full[va_idx]
+        y_tr, y_va = y_train_full[tr_idx], y_train_full[va_idx]
         tr_loader = DataLoader(
             TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr)),
             batch_size=train_kwargs['batch_size'], shuffle=True)
@@ -238,7 +245,7 @@ def _eval_all_subjects(models, data, mask, device):
     """Evaluate all subjects with a given channel mask. Returns list of 15 accuracies."""
     accs = []
     for subj in range(1, N_SUBJECTS + 1):
-        X_test, y_test = data[subj][3]
+        X_test, y_test, _ = data[subj][3]
         loader = DataLoader(
             TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
             batch_size=512, shuffle=False)
@@ -496,22 +503,25 @@ if __name__ == '__main__':
             subj = subj_idx + 1
             if subj not in data:
                 data[subj] = {}
-            X, y = load_seed4_session(str(mat_path), session_idx=sess - 1)
+            X, y, trial_ids = load_seed4_session(str(mat_path), session_idx=sess - 1)
             mean = X.mean(axis=0, keepdims=True)
             std = X.std(axis=0, keepdims=True) + 1e-8
             X = (X - mean) / std
-            data[subj][sess] = (X, y)
+            data[subj][sess] = (X, y, trial_ids)
     for subj in range(1, N_SUBJECTS + 1):
         sizes = [data[subj][s][0].shape[0] for s in range(1, N_SESSIONS + 1)]
         print(f"  Subject {subj:2d}: {sizes} samples per session")
 
-    # Pool sessions 1+2 for HP search
+    # Pool sessions 1+2 for HP search (trial IDs offset to be globally unique)
     X_pool = np.concatenate([data[s][sess][0]
                              for s in range(1, N_SUBJECTS + 1)
                              for sess in [1, 2]])
     y_pool = np.concatenate([data[s][sess][1]
                              for s in range(1, N_SUBJECTS + 1)
                              for sess in [1, 2]])
+    trial_pool = np.concatenate([data[s][sess][2] + s * 1000 + sess * 100
+                                 for s in range(1, N_SUBJECTS + 1)
+                                 for sess in [1, 2]])
     print(f"  Pooled shape: {X_pool.shape}, labels: {np.bincount(y_pool)}")
 
     # ── Phase 1: Hyperparameter search ──
@@ -549,7 +559,7 @@ if __name__ == '__main__':
                   'max_epochs': 200, 'patience': 15}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                ChannelAttentionEEGNet, mk, tk,
-                                               device=device)
+                                               device=device, groups=trial_pool)
             if mean_acc > best_score:
                 best_score = mean_acc
                 best_model_kwargs = mk
@@ -581,7 +591,7 @@ if __name__ == '__main__':
                   'max_epochs': 200, 'patience': 15}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                MLPBaseline, mk, tk,
-                                               device=device)
+                                               device=device, groups=trial_pool)
             if mean_acc > best_mlp_score:
                 best_mlp_score = mean_acc
                 best_mlp_kwargs = mk
@@ -603,7 +613,7 @@ if __name__ == '__main__':
     print("\n=== Phase 3: Channel importance extraction ===")
     importances = np.zeros((N_SUBJECTS, N_CHANNELS))
     for subj in range(1, N_SUBJECTS + 1):
-        X_test, y_test = data[subj][3]
+        X_test, y_test, _ = data[subj][3]
         loader = DataLoader(
             TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
             batch_size=512, shuffle=False)
@@ -628,7 +638,7 @@ if __name__ == '__main__':
     print("Computing per-emotion attention maps...")
     grand_emotion_imp = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
     for subj in range(1, N_SUBJECTS + 1):
-        X_test, y_test = data[subj][3]
+        X_test, y_test, _ = data[subj][3]
         loader = DataLoader(
             TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
             batch_size=512, shuffle=False)
