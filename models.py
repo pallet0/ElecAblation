@@ -51,9 +51,9 @@ class ChannelAttentionEEGNet(nn.Module):
             nn.Linear(d_hidden // 2, 1, bias=False),
         )
         self.classifier = nn.Sequential(
-            nn.BatchNorm1d(2 * d_hidden),
+            nn.BatchNorm1d(d_hidden),
             nn.Dropout(dropout),
-            nn.Linear(2 * d_hidden, d_hidden),
+            nn.Linear(d_hidden, d_hidden),
             nn.GELU(),
             nn.Linear(d_hidden, n_classes),
         )
@@ -71,15 +71,7 @@ class ChannelAttentionEEGNet(nn.Module):
         if channel_mask is not None:
             e = e.masked_fill(channel_mask == 0, float('-inf'))
         alpha = F.softmax(e, dim=-1)                # (B, C)
-        context_attn = torch.einsum('bc,bcd->bd', alpha, h)
-        # Mask-aware max pooling
-        if channel_mask is not None:
-            h_for_max = h.masked_fill(channel_mask.unsqueeze(-1) == 0, float('-inf'))
-        else:
-            h_for_max = h
-        context_max = h_for_max.max(dim=1)[0]       # (B, d_hidden)
-        # Dual context → classifier
-        context = torch.cat([context_attn, context_max], dim=-1)  # (B, 2*d_hidden)
+        context = torch.einsum('bc,bcd->bd', alpha, h)
         logits = self.classifier(context)
         return logits, alpha
 

@@ -123,7 +123,9 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
     """Group k-fold CV (trial-level splits). Returns (mean_acc, std_acc)."""
     gkf = GroupKFold(n_splits=k)
     fold_accs = []
-    for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups=groups)):
+    fold_bar = tqdm(enumerate(gkf.split(X, y, groups=groups)),
+                    total=k, desc='    Folds', leave=False)
+    for fold, (train_idx, val_idx) in fold_bar:
         X_tr = torch.tensor(X[train_idx])
         y_tr = torch.tensor(y[train_idx])
         X_va = torch.tensor(X[val_idx])
@@ -141,13 +143,13 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
         best_state = None
         patience_counter = 0
         channel_drop_rate = train_kwargs.get('channel_drop_rate', 0.0)
-        epoch_bar = tqdm(range(train_kwargs['max_epochs']),
-                         desc=f'    Fold {fold+1}/{k}', leave=False)
-        for epoch in epoch_bar:
+        for epoch in range(train_kwargs['max_epochs']):
             _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device,
                                            channel_drop_rate=channel_drop_rate)
             val_acc = evaluate(model, va_loader, device)
-            epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
+            fold_bar.set_postfix(fold=f'{fold+1}/{k}', epoch=epoch,
+                                 train=f'{train_acc:.4f}', val=f'{val_acc:.4f}',
+                                 best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_state = copy.deepcopy(model.state_dict())
@@ -156,9 +158,9 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
                 patience_counter += 1
                 if patience_counter >= train_kwargs['patience']:
                     break
-        epoch_bar.close()
         model.load_state_dict(best_state)
         fold_accs.append(evaluate(model, va_loader, device))
+    fold_bar.close()
     return float(np.mean(fold_accs)), float(np.std(fold_accs))
 
 
