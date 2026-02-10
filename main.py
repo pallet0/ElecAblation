@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from config import (
     CHANNEL_NAMES, DATA_ROOT, EMOTIV_EPOC, HEMISPHERES, MNE_NAME_MAP,
