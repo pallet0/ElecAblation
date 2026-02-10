@@ -67,12 +67,21 @@ def make_channel_mask(active_indices, n_channels=N_CHANNELS, batch_size=1):
 # Training / evaluation helpers
 # ────────────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, optimizer, criterion, device, channel_drop_rate=0.0):
+def train_one_epoch(model, loader, optimizer, criterion, device,
+                    channel_drop_rate=0.0, mixup_alpha=0.0):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for X_batch, y_batch in loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
+
+        # MixUp augmentation
+        if mixup_alpha > 0:
+            lam = np.random.beta(mixup_alpha, mixup_alpha)
+            idx = torch.randperm(X_batch.size(0), device=device)
+            X_batch = lam * X_batch + (1 - lam) * X_batch[idx]
+            y_a, y_b = y_batch, y_batch[idx]
+
         if isinstance(model, MLPBaseline):
             logits = model(X_batch.view(X_batch.size(0), -1))
         else:
@@ -82,17 +91,25 @@ def train_one_epoch(model, loader, optimizer, criterion, device, channel_drop_ra
                 # Ensure at least 1 channel kept per sample
                 all_zero = (mask.sum(dim=1) == 0)
                 if all_zero.any():
-                    idx = torch.randint(0, C, (all_zero.sum().item(),), device=device)
-                    mask[all_zero, idx] = 1.0
+                    idx_ch = torch.randint(0, C, (all_zero.sum().item(),), device=device)
+                    mask[all_zero, idx_ch] = 1.0
                 logits = model(X_batch, channel_mask=mask)[0]
             else:
                 logits = model(X_batch)[0]
-        loss = criterion(logits, y_batch)
+
+        if mixup_alpha > 0:
+            loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
+        else:
+            loss = criterion(logits, y_batch)
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item() * y_batch.size(0)
-        correct += (logits.argmax(1) == y_batch).sum().item()
+        if mixup_alpha > 0:
+            correct += (logits.argmax(1) == y_a).sum().item()
+        else:
+            correct += (logits.argmax(1) == y_batch).sum().item()
         total += y_batch.size(0)
     return total_loss / total, correct / total
 
@@ -143,9 +160,11 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
         best_state = None
         patience_counter = 0
         channel_drop_rate = train_kwargs.get('channel_drop_rate', 0.0)
+        mixup_alpha = train_kwargs.get('mixup_alpha', 0.0)
         for epoch in range(train_kwargs['max_epochs']):
             _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device,
-                                           channel_drop_rate=channel_drop_rate)
+                                           channel_drop_rate=channel_drop_rate,
+                                           mixup_alpha=mixup_alpha)
             val_acc = evaluate(model, va_loader, device)
             fold_bar.set_postfix(fold=f'{fold+1}/{k}', epoch=epoch,
                                  train=f'{train_acc:.4f}', val=f'{val_acc:.4f}',
@@ -206,11 +225,13 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
         best_state = None
         patience_counter = 0
         channel_drop_rate = train_kwargs.get('channel_drop_rate', 0.0)
+        mixup_alpha = train_kwargs.get('mixup_alpha', 0.0)
         epoch_bar = tqdm(range(train_kwargs['max_epochs']),
                          desc=f'  S{subj:02d} epochs', leave=False)
         for epoch in epoch_bar:
             _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device,
-                                           channel_drop_rate=channel_drop_rate)
+                                           channel_drop_rate=channel_drop_rate,
+                                           mixup_alpha=mixup_alpha)
             val_acc = evaluate(model, va_loader, device)
             epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
@@ -757,7 +778,8 @@ if __name__ == '__main__':
         best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
                              'd_hidden': 64, 'dropout': 0.3}
         best_train_kwargs = {'lr': 5e-4, 'wd': 1e-3, 'batch_size': 128,
-                             'max_epochs': 200, 'patience': 10}
+                             'max_epochs': 200, 'patience': 10,
+                             'mixup_alpha': 0.2}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
                            'h1': 128, 'h2': 64, 'dropout': 0.5}
         best_mlp_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
@@ -771,6 +793,7 @@ if __name__ == '__main__':
             'lr':       [5e-4, 1e-4],
             'wd':       [1e-4, 5e-4],
             'batch_size': [64, 128],
+            'mixup_alpha': [0.0, 0.2],
         }
         best_score = 0.0
         best_model_kwargs = None
@@ -779,13 +802,15 @@ if __name__ == '__main__':
             search_space['d_hidden'],
             search_space['dropout'],
             search_space['lr'], search_space['wd'], search_space['batch_size'],
+            search_space['mixup_alpha'],
         ))
         pbar_1a = tqdm(configs_1a, desc='Attention HP search')
-        for d_h, drop, lr, wd, bs in pbar_1a:
+        for d_h, drop, lr, wd, bs, mix_a in pbar_1a:
             mk = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
                    'd_hidden': d_h, 'dropout': drop}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
-                  'max_epochs': 200, 'patience': 10}
+                  'max_epochs': 200, 'patience': 10,
+                  'mixup_alpha': mix_a}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                ChannelAttentionEEGNet, mk, tk,
                                                device=device, groups=trial_pool)
