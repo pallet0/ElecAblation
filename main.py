@@ -67,7 +67,7 @@ def make_channel_mask(active_indices, n_channels=N_CHANNELS, batch_size=1):
 # Training / evaluation helpers
 # ────────────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, criterion, device, channel_drop_rate=0.0):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for X_batch, y_batch in loader:
@@ -76,7 +76,17 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         if isinstance(model, MLPBaseline):
             logits = model(X_batch.view(X_batch.size(0), -1))
         else:
-            logits = model(X_batch)[0]
+            if channel_drop_rate > 0:
+                B, C = X_batch.size(0), X_batch.size(1)
+                mask = (torch.rand(B, C, device=device) >= channel_drop_rate).float()
+                # Ensure at least 1 channel kept per sample
+                all_zero = (mask.sum(dim=1) == 0)
+                if all_zero.any():
+                    idx = torch.randint(0, C, (all_zero.sum().item(),), device=device)
+                    mask[all_zero, idx] = 1.0
+                logits = model(X_batch, channel_mask=mask)[0]
+            else:
+                logits = model(X_batch)[0]
         loss = criterion(logits, y_batch)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -130,10 +140,12 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
         best_val_acc = 0.0
         best_state = None
         patience_counter = 0
+        channel_drop_rate = train_kwargs.get('channel_drop_rate', 0.0)
         epoch_bar = tqdm(range(train_kwargs['max_epochs']),
                          desc=f'    Fold {fold+1}/{k}', leave=False)
         for epoch in epoch_bar:
-            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device)
+            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device,
+                                           channel_drop_rate=channel_drop_rate)
             val_acc = evaluate(model, va_loader, device)
             epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
@@ -191,10 +203,12 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
         best_val_acc = 0.0
         best_state = None
         patience_counter = 0
+        channel_drop_rate = train_kwargs.get('channel_drop_rate', 0.0)
         epoch_bar = tqdm(range(train_kwargs['max_epochs']),
                          desc=f'  S{subj:02d} epochs', leave=False)
         for epoch in epoch_bar:
-            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device)
+            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device,
+                                           channel_drop_rate=channel_drop_rate)
             val_acc = evaluate(model, va_loader, device)
             epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
@@ -544,10 +558,11 @@ if __name__ == '__main__':
     # ── Phase 1: Hyperparameter search ──
     if args.skip_search:
         best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
-                             'd_hidden': 64, 'dropout': 0.3, 'n_heads': 4,
+                             'd_hidden': 64, 'dropout': 0.5, 'n_heads': 4,
                              'dim_feedforward': 128}
         best_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
-                             'max_epochs': 200, 'patience': 10}
+                             'max_epochs': 200, 'patience': 10,
+                             'channel_drop_rate': 0.15}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
                            'h1': 128, 'h2': 64, 'dropout': 0.5}
         best_mlp_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
@@ -577,7 +592,8 @@ if __name__ == '__main__':
                    'd_hidden': d_h, 'dropout': drop, 'n_heads': 4,
                    'dim_feedforward': d_ff}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
-                  'max_epochs': 200, 'patience': 10}
+                  'max_epochs': 200, 'patience': 10,
+                  'channel_drop_rate': 0.15}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                ChannelAttentionEEGNet, mk, tk,
                                                device=device, groups=trial_pool)
