@@ -132,9 +132,9 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
         epoch_bar = tqdm(range(train_kwargs['max_epochs']),
                          desc=f'    Fold {fold+1}/{k}', leave=False)
         for epoch in epoch_bar:
-            train_one_epoch(model, tr_loader, optimizer, criterion, device)
+            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device)
             val_acc = evaluate(model, va_loader, device)
-            epoch_bar.set_postfix(val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
+            epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_state = copy.deepcopy(model.state_dict())
@@ -193,9 +193,9 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
         epoch_bar = tqdm(range(train_kwargs['max_epochs']),
                          desc=f'  S{subj:02d} epochs', leave=False)
         for epoch in epoch_bar:
-            train_one_epoch(model, tr_loader, optimizer, criterion, device)
+            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device)
             val_acc = evaluate(model, va_loader, device)
-            epoch_bar.set_postfix(val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
+            epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_state = copy.deepcopy(model.state_dict())
