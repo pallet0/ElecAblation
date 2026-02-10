@@ -79,6 +79,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
             logits = model(X_batch)[0]
         loss = criterion(logits, y_batch)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item() * y_batch.size(0)
         correct += (logits.argmax(1) == y_batch).sum().item()
@@ -125,7 +126,9 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
         optimizer = torch.optim.Adam(model.parameters(),
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5)
         best_val_acc = 0.0
         best_state = None
         patience_counter = 0
@@ -134,6 +137,7 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
         for epoch in epoch_bar:
             _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device)
             val_acc = evaluate(model, va_loader, device)
+            scheduler.step(val_acc)
             epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
@@ -186,7 +190,9 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
         optimizer = torch.optim.Adam(model.parameters(),
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5)
         best_val_acc = 0.0
         best_state = None
         patience_counter = 0
@@ -195,6 +201,7 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
         for epoch in epoch_bar:
             _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device)
             val_acc = evaluate(model, va_loader, device)
+            scheduler.step(val_acc)
             epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
@@ -532,7 +539,7 @@ if __name__ == '__main__':
     # ── Phase 1: Hyperparameter search ──
     if args.skip_search:
         best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
-                             'd_hidden': 64, 'dropout': 0.5}
+                             'd_hidden': 128, 'dropout': 0.5}
         best_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
                              'max_epochs': 200, 'patience': 15}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
@@ -543,11 +550,11 @@ if __name__ == '__main__':
     else:
         print("\n=== Phase 1a: Attention HP search (5-fold CV) ===")
         search_space = {
-            'd_hidden': [32, 64],
+            'd_hidden': [64, 128],
             'dropout':  [0.3, 0.5],
-            'lr':       [5e-4, 1e-4],
-            'wd':       [1e-4],
-            'batch_size': [128],
+            'lr':       [1e-3, 5e-4, 1e-4],
+            'wd':       [1e-5, 1e-4],
+            'batch_size': [64, 128],
         }
         best_score = 0.0
         best_model_kwargs = None
