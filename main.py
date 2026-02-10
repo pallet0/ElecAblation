@@ -535,11 +535,11 @@ if __name__ == '__main__':
         best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
                              'd_hidden': 32, 'dropout': 0.5}
         best_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
-                             'max_epochs': 200, 'patience': 15}
+                             'max_epochs': 200, 'patience': 7}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
                            'h1': 128, 'h2': 64, 'dropout': 0.5}
         best_mlp_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
-                                 'max_epochs': 200, 'patience': 15}
+                                 'max_epochs': 200, 'patience': 7}
         print("\n=== Phase 1: Skipped (using defaults) ===")
     else:
         print("\n=== Phase 1a: Attention HP search (5-fold CV) ===")
@@ -562,7 +562,7 @@ if __name__ == '__main__':
             mk = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
                    'd_hidden': d_h, 'dropout': drop}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
-                  'max_epochs': 200, 'patience': 15}
+                  'max_epochs': 200, 'patience': 7}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                ChannelAttentionEEGNet, mk, tk,
                                                device=device, groups=trial_pool)
@@ -594,7 +594,7 @@ if __name__ == '__main__':
             mk = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
                    'h1': h1, 'h2': h2, 'dropout': drop}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
-                  'max_epochs': 200, 'patience': 15}
+                  'max_epochs': 200, 'patience': 7}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                MLPBaseline, mk, tk,
                                                device=device, groups=trial_pool)
