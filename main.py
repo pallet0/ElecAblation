@@ -471,9 +471,15 @@ if __name__ == '__main__':
     # ── Phase 0: Load all data with per-session z-score normalization ──
     print("\n=== Phase 0: Loading data ===")
     data_root = Path(args.data_root)
+    if not data_root.is_dir():
+        raise FileNotFoundError(f"Data root not found: {data_root}")
     data = {}
     for sess in range(1, N_SESSIONS + 1):
         sess_dir = data_root / str(sess)
+        if not sess_dir.is_dir():
+            raise FileNotFoundError(
+                f"Session directory not found: {sess_dir}\n"
+                f"Expected {data_root}/1/, {data_root}/2/, {data_root}/3/")
         mat_files = sorted(sess_dir.glob('*.mat'),
                            key=lambda p: int(p.stem.split('_')[0]))
         for subj_idx, mat_path in enumerate(mat_files):
