@@ -19,7 +19,7 @@ from config import (
     MUSE_APPROX, N_BANDS, N_CHANNELS, N_CLASSES, N_SESSIONS, N_SUBJECTS,
     REGIONS_FINE, SESSION_LABELS, STANDARD_1020,
 )
-from models import ChannelAttentionEEGNet, MLPBaseline
+from models import MLPBaseline
 
 # ────────────────────────────────────────────────────────────────────
 # Data loading
@@ -68,7 +68,7 @@ def make_channel_mask(active_indices, n_channels=N_CHANNELS, batch_size=1):
 # ────────────────────────────────────────────────────────────────────
 
 def train_one_epoch(model, loader, optimizer, criterion, device,
-                    channel_drop_rate=0.0, mixup_alpha=0.0):
+                    mixup_alpha=0.0):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for X_batch, y_batch in loader:
@@ -82,20 +82,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
             X_batch = lam * X_batch + (1 - lam) * X_batch[idx]
             y_a, y_b = y_batch, y_batch[idx]
 
-        if isinstance(model, MLPBaseline):
-            logits = model(X_batch.view(X_batch.size(0), -1))
-        else:
-            if channel_drop_rate > 0:
-                B, C = X_batch.size(0), X_batch.size(1)
-                mask = (torch.rand(B, C, device=device) >= channel_drop_rate).float()
-                # Ensure at least 1 channel kept per sample
-                all_zero = (mask.sum(dim=1) == 0)
-                if all_zero.any():
-                    idx_ch = torch.randint(0, C, (all_zero.sum().item(),), device=device)
-                    mask[all_zero, idx_ch] = 1.0
-                logits = model(X_batch, channel_mask=mask)[0]
-            else:
-                logits = model(X_batch)[0]
+        logits = model(X_batch.view(X_batch.size(0), -1))
 
         if mixup_alpha > 0:
             loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
@@ -120,12 +107,10 @@ def evaluate(model, loader, device, channel_mask=None):
     correct, total = 0, 0
     for X_batch, y_batch in loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        if isinstance(model, MLPBaseline):
-            logits = model(X_batch.view(X_batch.size(0), -1))
-        else:
-            B = X_batch.size(0)
-            mask = channel_mask.expand(B, -1).to(device) if channel_mask is not None else None
-            logits = model(X_batch, channel_mask=mask)[0]
+        if channel_mask is not None:
+            mask = channel_mask.to(device).unsqueeze(-1)  # (1,C,1)
+            X_batch = X_batch * mask
+        logits = model(X_batch.view(X_batch.size(0), -1))
         correct += (logits.argmax(1) == y_batch).sum().item()
         total += y_batch.size(0)
     return correct / total
@@ -161,11 +146,9 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
         best_val_acc = 0.0
         best_state = None
         patience_counter = 0
-        channel_drop_rate = train_kwargs.get('channel_drop_rate', 0.0)
         mixup_alpha = train_kwargs.get('mixup_alpha', 0.0)
         for epoch in range(train_kwargs['max_epochs']):
             _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device,
-                                           channel_drop_rate=channel_drop_rate,
                                            mixup_alpha=mixup_alpha)
             val_acc = evaluate(model, va_loader, device)
             scheduler.step()
@@ -230,13 +213,11 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
         best_val_acc = 0.0
         best_state = None
         patience_counter = 0
-        channel_drop_rate = train_kwargs.get('channel_drop_rate', 0.0)
         mixup_alpha = train_kwargs.get('mixup_alpha', 0.0)
         epoch_bar = tqdm(range(train_kwargs['max_epochs']),
                          desc=f'  S{subj:02d} epochs', leave=False)
         for epoch in epoch_bar:
             _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device,
-                                           channel_drop_rate=channel_drop_rate,
                                            mixup_alpha=mixup_alpha)
             val_acc = evaluate(model, va_loader, device)
             scheduler.step()
@@ -262,24 +243,54 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
 
 
 # ────────────────────────────────────────────────────────────────────
-# Per-emotion importance (Phase 5 visualization helper)
+# Permutation importance (Phase 3 / Phase 5)
 # ────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def per_emotion_importance(model, loader, device, n_classes=N_CLASSES):
-    """Attention weights grouped by emotion class. Returns {class_id: (62,) array}."""
+def permutation_importance(model, X, y, device, n_repeats=10):
+    """Compute permutation importance for each of 62 channels.
+
+    Args:
+        model: trained MLPBaseline
+        X: numpy array (N, 62, 5)
+        y: numpy array (N,)
+        device: torch device
+        n_repeats: number of shuffle repeats per channel
+    Returns: (62,) array where positive = important (shuffling hurts accuracy)
+    """
     model.eval()
-    class_alphas = {c: [] for c in range(n_classes)}
-    for X_batch, y_batch in loader:
-        X_batch = X_batch.to(device)
-        _, alpha = model(X_batch)
-        alpha = alpha.cpu()
-        for c in range(n_classes):
-            mask_c = (y_batch == c)
-            if mask_c.any():
-                class_alphas[c].append(alpha[mask_c])
-    return {c: torch.cat(class_alphas[c], dim=0).mean(dim=0).numpy()
-            for c in range(n_classes) if class_alphas[c]}
+    X_t = torch.tensor(X, dtype=torch.float32, device=device)
+    y_t = torch.tensor(y, dtype=torch.long, device=device)
+    # Baseline accuracy
+    logits = model(X_t.view(X_t.size(0), -1))
+    baseline_acc = (logits.argmax(1) == y_t).float().mean().item()
+    n_channels = X.shape[1]
+    importances = np.zeros(n_channels)
+    for ch in range(n_channels):
+        shuffled_accs = []
+        for _ in range(n_repeats):
+            X_perm = X_t.clone()
+            perm_idx = torch.randperm(X_perm.size(0), device=device)
+            X_perm[:, ch, :] = X_perm[perm_idx, ch, :]
+            logits = model(X_perm.view(X_perm.size(0), -1))
+            acc = (logits.argmax(1) == y_t).float().mean().item()
+            shuffled_accs.append(acc)
+        importances[ch] = baseline_acc - float(np.mean(shuffled_accs))
+    return importances
+
+
+@torch.no_grad()
+def per_emotion_permutation_importance(model, X, y, device,
+                                        n_repeats=10, n_classes=N_CLASSES):
+    """Permutation importance per emotion class. Returns {class_id: (62,) array}."""
+    result = {}
+    for c in range(n_classes):
+        mask_c = (y == c)
+        if mask_c.sum() == 0:
+            continue
+        result[c] = permutation_importance(model, X[mask_c], y[mask_c],
+                                            device, n_repeats=n_repeats)
+    return result
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -299,10 +310,11 @@ def _eval_all_subjects(models, data, mask, device):
 
 
 def _retrain_all_subjects(data, channel_indices, model_kwargs, train_kwargs, device):
-    """Retrain fresh models using only selected channels. Returns list of 15 accuracies."""
+    """Retrain fresh MLPBaseline using only selected channels. Returns list of 15 accuracies."""
     n_ch = len(channel_indices)
     ch_idx = list(channel_indices)
-    mk = {**model_kwargs, 'n_channels': n_ch}
+    mk = {**model_kwargs, 'input_dim': n_ch * N_BANDS}
+    mixup_alpha = train_kwargs.get('mixup_alpha', 0.0)
     accs = []
     for subj in range(1, N_SUBJECTS + 1):
         X_train_full = np.concatenate([data[subj][1][0][:, ch_idx, :],
@@ -326,7 +338,7 @@ def _retrain_all_subjects(data, channel_indices, model_kwargs, train_kwargs, dev
         te_loader = DataLoader(
             TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
             batch_size=512, shuffle=False)
-        model = ChannelAttentionEEGNet(**mk).to(device)
+        model = MLPBaseline(**mk).to(device)
         optimizer = torch.optim.Adam(model.parameters(),
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
@@ -337,7 +349,8 @@ def _retrain_all_subjects(data, channel_indices, model_kwargs, train_kwargs, dev
         best_state = None
         patience_counter = 0
         for epoch in range(train_kwargs['max_epochs']):
-            train_one_epoch(model, tr_loader, optimizer, criterion, device)
+            train_one_epoch(model, tr_loader, optimizer, criterion, device,
+                            mixup_alpha=mixup_alpha)
             val_acc = evaluate(model, va_loader, device)
             scheduler.step()
             if val_acc > best_val_acc:
@@ -409,8 +422,8 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
     # Progressive ablation (attention-guided: least first, most first)
     n_keep_steps = [62, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 8, 5, 3, 1]
     for strategy_name, ranking in [
-        ('attn_least_first', grand_ranking),
-        ('attn_most_first', grand_ranking[::-1]),
+        ('pi_least_first', grand_ranking),
+        ('pi_most_first', grand_ranking[::-1]),
     ]:
         curve = {}
         for n_keep in n_keep_steps:
@@ -496,8 +509,8 @@ def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
     # Progressive attention-guided (fewer steps to manage cost)
     n_keep_steps = [62, 50, 40, 30, 20, 10, 5, 1]
     for strategy_name, ranking in [
-        ('attn_least_first', grand_ranking),
-        ('attn_most_first', grand_ranking[::-1]),
+        ('pi_least_first', grand_ranking),
+        ('pi_most_first', grand_ranking[::-1]),
     ]:
         curve = {}
         step_bar = tqdm(n_keep_steps, desc=f'  Retrain {strategy_name}')
@@ -543,21 +556,15 @@ def plot_progressive_ablation_curves(results, retrain_results=None):
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
     curves_to_plot = [
-        ('progressive_attn_least_first', '#2ecc71', 'Mask (least first)', '-', 'o'),
-        ('progressive_random',           '#95a5a6', 'Mask random',        '-', 'o'),
-        ('progressive_attn_most_first',  '#e74c3c', 'Mask (most first)',  '-', 'o'),
+        ('progressive_pi_least_first', '#2ecc71', 'PI least important first', '-', 'o'),
+        ('progressive_random',         '#95a5a6', 'Random',                   '-', 'o'),
+        ('progressive_pi_most_first',  '#e74c3c', 'PI most important first',  '-', 'o'),
     ]
     if retrain_results is not None:
         curves_to_plot.extend([
-            ('retrain_progressive_attn_least_first', '#2ecc71', 'Retrain (least first)', '--', '^'),
-            ('retrain_progressive_random',           '#95a5a6', 'Retrain random',        '--', '^'),
-            ('retrain_progressive_attn_most_first',  '#e74c3c', 'Retrain (most first)',  '--', '^'),
-        ])
-    if 'dual_progressive_attn_least_first' in results:
-        curves_to_plot.extend([
-            ('dual_progressive_attn_least_first', '#2ecc71', 'DualAttn (least first)', '--', 's'),
-            ('dual_progressive_random',           '#95a5a6', 'DualAttn random',        '--', 's'),
-            ('dual_progressive_attn_most_first',  '#e74c3c', 'DualAttn (most first)',  '--', 's'),
+            ('retrain_progressive_pi_least_first', '#2ecc71', 'Retrain (least first)', '--', '^'),
+            ('retrain_progressive_random',         '#95a5a6', 'Retrain random',        '--', '^'),
+            ('retrain_progressive_pi_most_first',  '#e74c3c', 'Retrain (most first)',  '--', '^'),
         ])
     # Merge retrain curves into a combined dict for lookup
     _all_curves = dict(results)
@@ -611,9 +618,9 @@ def _make_topo_info():
     return mne.pick_info(info, picks), np.array(picks)
 
 
-def plot_topographic_attention(grand_importance,
-                               title='Channel Attention Weights (Grand Average)',
-                               filename='topomap_attention.pdf'):
+def plot_topographic_importance(grand_importance,
+                                title='Permutation Importance (Grand Average)',
+                                filename='topomap_importance.pdf'):
     import matplotlib.pyplot as plt
     import mne
     info, picks = _make_topo_info()
@@ -680,7 +687,7 @@ def plot_per_emotion_topomap(emotion_importances):
         mne.viz.plot_topomap(emotion_importances[c][picks], info, axes=axes[c],
                              show=False, cmap='RdYlBu_r', contours=0)
         axes[c].set_title(emotion_labels.get(c, str(c)), fontsize=13)
-    plt.suptitle('Per-Emotion Channel Attention', fontsize=15, y=1.02)
+    plt.suptitle('Per-Emotion Permutation Importance', fontsize=15, y=1.02)
     plt.tight_layout()
     plt.savefig('per_emotion_topomap.pdf', dpi=300, bbox_inches='tight')
     print("Saved per_emotion_topomap.pdf")
@@ -783,76 +790,38 @@ if __name__ == '__main__':
                                  for sess in [1, 2]])
     print(f"  Pooled shape: {X_pool.shape}, labels: {np.bincount(y_pool)}")
 
-    # ── Phase 1: Hyperparameter search ──
+    # ── Phase 1: Hyperparameter search (MLP only) ──
     if args.skip_search:
-        best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
-                             'd_hidden': 64, 'dropout': 0.3}
-        best_train_kwargs = {'lr': 5e-4, 'wd': 1e-3, 'batch_size': 128,
-                             'max_epochs': 200, 'patience': 20,
-                             'mixup_alpha': 0.2}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
                            'h1': 128, 'h2': 64, 'dropout': 0.5}
         best_mlp_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
-                                 'max_epochs': 200, 'patience': 10}
+                                 'max_epochs': 200, 'patience': 10,
+                                 'mixup_alpha': 0.0}
         print("\n=== Phase 1: Skipped (using defaults) ===")
     else:
-        print("\n=== Phase 1a: Attention HP search (5-fold CV) ===")
-        search_space = {
-            'd_hidden': [64],
-            'dropout':  [0.3, 0.5],
-            'lr':       [5e-4, 1e-4],
-            'wd':       [1e-4, 5e-4],
-            'batch_size': [64, 128],
-            'mixup_alpha': [0.0, 0.2],
-        }
-        best_score = 0.0
-        best_model_kwargs = None
-        best_train_kwargs = None
-        configs_1a = list(itertools.product(
-            search_space['d_hidden'],
-            search_space['dropout'],
-            search_space['lr'], search_space['wd'], search_space['batch_size'],
-            search_space['mixup_alpha'],
-        ))
-        pbar_1a = tqdm(configs_1a, desc='Attention HP search')
-        for d_h, drop, lr, wd, bs, mix_a in pbar_1a:
-            mk = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
-                   'd_hidden': d_h, 'dropout': drop}
-            tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
-                  'max_epochs': 200, 'patience': 20,
-                  'mixup_alpha': mix_a}
-            mean_acc, std_acc = cross_validate(X_pool, y_pool,
-                                               ChannelAttentionEEGNet, mk, tk,
-                                               device=device, groups=trial_pool)
-            if mean_acc > best_score:
-                best_score = mean_acc
-                best_model_kwargs = mk
-                best_train_kwargs = tk
-            pbar_1a.set_postfix(best=f'{best_score:.4f}', last=f'{mean_acc:.4f}')
-        print(f"Best CV Acc: {best_score:.4f}")
-        print(f"Best config: {best_model_kwargs}, {best_train_kwargs}")
-
-        # Phase 1b: MLP HP search
-        print("\n=== Phase 1b: MLP HP search (5-fold CV) ===")
+        print("\n=== Phase 1: MLP HP search (5-fold CV) ===")
         mlp_search_space = {
             'h1': [128, 256], 'h2': [64],
             'dropout': [0.3, 0.5], 'lr': [5e-4],
             'wd': [1e-4], 'batch_size': [128],
+            'mixup_alpha': [0.0, 0.2],
         }
         best_mlp_score = 0.0
         best_mlp_kwargs = None
         best_mlp_train_kwargs = None
-        configs_1b = list(itertools.product(
+        configs = list(itertools.product(
             mlp_search_space['h1'], mlp_search_space['h2'],
             mlp_search_space['dropout'], mlp_search_space['lr'],
             mlp_search_space['wd'], mlp_search_space['batch_size'],
+            mlp_search_space['mixup_alpha'],
         ))
-        pbar_1b = tqdm(configs_1b, desc='MLP HP search')
-        for h1, h2, drop, lr, wd, bs in pbar_1b:
+        pbar = tqdm(configs, desc='MLP HP search')
+        for h1, h2, drop, lr, wd, bs, mix_a in pbar:
             mk = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
                    'h1': h1, 'h2': h2, 'dropout': drop}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
-                  'max_epochs': 200, 'patience': 10}
+                  'max_epochs': 200, 'patience': 10,
+                  'mixup_alpha': mix_a}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                MLPBaseline, mk, tk,
                                                device=device, groups=trial_pool)
@@ -860,29 +829,24 @@ if __name__ == '__main__':
                 best_mlp_score = mean_acc
                 best_mlp_kwargs = mk
                 best_mlp_train_kwargs = tk
-            pbar_1b.set_postfix(best=f'{best_mlp_score:.4f}', last=f'{mean_acc:.4f}')
+            pbar.set_postfix(best=f'{best_mlp_score:.4f}', last=f'{mean_acc:.4f}')
         print(f"Best MLP CV Acc: {best_mlp_score:.4f}")
         print(f"Best MLP config: {best_mlp_kwargs}, {best_mlp_train_kwargs}")
 
-    # ── Phase 2: Per-subject train/test ──
-    print("\n=== Phase 2a: ChannelAttentionEEGNet ===")
-    attn_results, attn_models = train_and_evaluate(
-        data, ChannelAttentionEEGNet, best_model_kwargs, best_train_kwargs, device)
-
-    print("\n=== Phase 2b: MLPBaseline ===")
+    # ── Phase 2: Per-subject train/test (MLP only) ──
+    print("\n=== Phase 2: MLPBaseline ===")
     mlp_results, mlp_models = train_and_evaluate(
         data, MLPBaseline, best_mlp_kwargs, best_mlp_train_kwargs, device)
 
-    # ── Phase 3: Extract channel importance ──
-    print("\n=== Phase 3: Channel importance extraction ===")
+    # ── Phase 3: Permutation importance ──
+    print("\n=== Phase 3: Permutation importance ===")
     importances = np.zeros((N_SUBJECTS, N_CHANNELS))
-    for subj in range(1, N_SUBJECTS + 1):
+    pi_bar = tqdm(range(1, N_SUBJECTS + 1), desc='PI subjects')
+    for subj in pi_bar:
         X_test, y_test, _ = data[subj][3]
-        loader = DataLoader(
-            TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
-            batch_size=512, shuffle=False)
-        mean_alpha, _ = attn_models[subj].get_channel_importance(loader, device)
-        importances[subj - 1] = mean_alpha
+        importances[subj - 1] = permutation_importance(
+            mlp_models[subj], X_test, y_test, device, n_repeats=10)
+        pi_bar.set_postfix(subj=subj)
     grand_importance = importances.mean(axis=0)
     grand_ranking = grand_importance.argsort()[::-1].copy()
     print("  Top-10 channels:", [CHANNEL_NAMES[i] for i in grand_ranking[:10]])
@@ -890,32 +854,32 @@ if __name__ == '__main__':
     # ── Phase 4: Full ablation study ──
     print("\n=== Phase 4: Ablation study ===")
     ablation_results = run_full_ablation_study(
-        attn_models, data, grand_ranking, device)
+        mlp_models, data, grand_ranking, device)
 
     # ── Phase 4b: Retrain-from-scratch ablation (optional) ──
     retrain_ablation_results = None
     if args.retrain_ablation:
         print("\n=== Phase 4b: Retrain-from-scratch ablation ===")
         retrain_ablation_results = run_retrain_ablation_study(
-            data, grand_ranking, best_model_kwargs, best_train_kwargs, device)
+            data, grand_ranking, best_mlp_kwargs, best_mlp_train_kwargs, device)
 
     # ── Phase 5: Visualization & statistics ──
     print("\n=== Phase 5: Visualization ===")
     plot_progressive_ablation_curves(ablation_results, retrain_ablation_results)
-    plot_topographic_attention(grand_importance)
+    plot_topographic_importance(grand_importance)
     plot_region_ablation_table(ablation_results)
 
-    # Per-emotion attention maps (grand average across subjects)
-    print("Computing per-emotion attention maps...")
+    # Per-emotion permutation importance (grand average across subjects)
+    print("Computing per-emotion permutation importance...")
     grand_emotion_imp = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
-    for subj in range(1, N_SUBJECTS + 1):
+    emo_bar = tqdm(range(1, N_SUBJECTS + 1), desc='Per-emotion PI')
+    for subj in emo_bar:
         X_test, y_test, _ = data[subj][3]
-        loader = DataLoader(
-            TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
-            batch_size=512, shuffle=False)
-        subj_emo = per_emotion_importance(attn_models[subj], loader, device)
+        subj_emo = per_emotion_permutation_importance(
+            mlp_models[subj], X_test, y_test, device, n_repeats=10)
         for c in subj_emo:
             grand_emotion_imp[c] += subj_emo[c]
+        emo_bar.set_postfix(subj=subj)
     for c in grand_emotion_imp:
         grand_emotion_imp[c] /= N_SUBJECTS
     plot_per_emotion_topomap(grand_emotion_imp)
@@ -957,15 +921,11 @@ if __name__ == '__main__':
 
     # Save all results
     save_results = {
-        'attention_per_subject': {str(k): v for k, v in attn_results.items()},
         'mlp_per_subject': {str(k): v for k, v in mlp_results.items()},
-        'attention_mean': float(np.mean(list(attn_results.values()))),
         'mlp_mean': float(np.mean(list(mlp_results.values()))),
         'grand_ranking': grand_ranking.tolist(),
         'grand_importance': grand_importance.tolist(),
         'ablation': ablation_results,
-        'best_model_kwargs': best_model_kwargs,
-        'best_train_kwargs': best_train_kwargs,
         'best_mlp_kwargs': best_mlp_kwargs,
         'best_mlp_train_kwargs': best_mlp_train_kwargs,
     }
