@@ -126,9 +126,12 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
         best_val_acc = 0.0
         best_state = None
         patience_counter = 0
-        for epoch in range(train_kwargs['max_epochs']):
+        epoch_bar = tqdm(range(train_kwargs['max_epochs']),
+                         desc=f'    Fold {fold+1}/{k}', leave=False)
+        for epoch in epoch_bar:
             train_one_epoch(model, tr_loader, optimizer, criterion, device)
             val_acc = evaluate(model, va_loader, device)
+            epoch_bar.set_postfix(val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_state = copy.deepcopy(model.state_dict())
@@ -137,6 +140,7 @@ def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cud
                 patience_counter += 1
                 if patience_counter >= train_kwargs['patience']:
                     break
+        epoch_bar.close()
         model.load_state_dict(best_state)
         fold_accs.append(evaluate(model, va_loader, device))
     return float(np.mean(fold_accs)), float(np.std(fold_accs))
