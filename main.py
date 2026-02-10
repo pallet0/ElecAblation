@@ -756,7 +756,7 @@ if __name__ == '__main__':
     if args.skip_search:
         best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
                              'd_hidden': 64, 'dropout': 0.3, 'n_heads': 4,
-                             'dim_feedforward': 128}
+                             'dim_feedforward': 64}
         best_train_kwargs = {'lr': 5e-4, 'wd': 1e-3, 'batch_size': 128,
                              'max_epochs': 200, 'patience': 10}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
