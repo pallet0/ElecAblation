@@ -558,11 +558,10 @@ if __name__ == '__main__':
     # ── Phase 1: Hyperparameter search ──
     if args.skip_search:
         best_model_kwargs = {'n_bands': N_BANDS, 'n_classes': N_CLASSES,
-                             'd_hidden': 64, 'dropout': 0.5, 'n_heads': 4,
+                             'd_hidden': 64, 'dropout': 0.3, 'n_heads': 4,
                              'dim_feedforward': 128}
         best_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
-                             'max_epochs': 200, 'patience': 10,
-                             'channel_drop_rate': 0.15}
+                             'max_epochs': 200, 'patience': 10}
         best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
                            'h1': 128, 'h2': 64, 'dropout': 0.5}
         best_mlp_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
@@ -592,8 +591,7 @@ if __name__ == '__main__':
                    'd_hidden': d_h, 'dropout': drop, 'n_heads': 4,
                    'dim_feedforward': d_ff}
             tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
-                  'max_epochs': 200, 'patience': 10,
-                  'channel_drop_rate': 0.15}
+                  'max_epochs': 200, 'patience': 10}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
                                                ChannelAttentionEEGNet, mk, tk,
                                                device=device, groups=trial_pool)

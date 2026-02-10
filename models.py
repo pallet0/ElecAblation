@@ -5,6 +5,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class _ChannelBN(nn.Module):
+    """BatchNorm1d for (B, C, D) tensors — normalizes each D feature across B*C."""
+    def __init__(self, d):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(d)
+    def forward(self, x):
+        B, C, D = x.shape
+        return self.bn(x.reshape(B * C, D)).reshape(B, C, D)
+
+
 class ChannelAttentionEEGNet(nn.Module):
     """Shared spectral encoder + Bahdanau attention + classifier.
 
@@ -17,10 +27,11 @@ class ChannelAttentionEEGNet(nn.Module):
         super().__init__()
         self.spectral_encoder = nn.Sequential(
             nn.Linear(n_bands, d_hidden),
-            nn.LayerNorm(d_hidden),
+            _ChannelBN(d_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_hidden, d_hidden),
+            _ChannelBN(d_hidden),
             nn.GELU(),
         )
         self.channel_embedding = nn.Parameter(
@@ -40,7 +51,7 @@ class ChannelAttentionEEGNet(nn.Module):
             nn.Linear(d_hidden // 2, 1, bias=False),
         )
         self.classifier = nn.Sequential(
-            nn.LayerNorm(d_hidden),
+            nn.BatchNorm1d(d_hidden),
             nn.Dropout(dropout),
             nn.Linear(d_hidden, d_hidden),
             nn.GELU(),
