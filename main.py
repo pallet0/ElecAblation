@@ -356,7 +356,90 @@ def _retrain_loso(data, channel_indices, model_kwargs, train_kwargs, device):
     return accs
 
 
-def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
+def find_knee_point(x, y):
+    """Find the knee point using maximum perpendicular distance to the chord.
+
+    Draws a chord from the first to the last data point and finds the point
+    with the greatest perpendicular distance from the chord.
+
+    Args:
+        x: 1D array of x-values (e.g. number of channels), ordered
+        y: 1D array of y-values (e.g. accuracy)
+    Returns:
+        dict with knee_x, knee_y, knee_index, distances
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    # Chord from first to last point
+    x0, y0 = x[0], y[0]
+    x1, y1 = x[-1], y[-1]
+    dx, dy = x1 - x0, y1 - y0
+    denom = np.sqrt(dx ** 2 + dy ** 2)
+    if denom < 1e-12:
+        # Degenerate: flat line — pick midpoint
+        idx = len(x) // 2
+        return {'knee_x': x[idx], 'knee_y': y[idx], 'knee_index': idx,
+                'distances': np.zeros(len(x))}
+    # Perpendicular distance from each point to the chord line
+    distances = np.abs(dy * x - dx * y + (x1 * y0 - x0 * y1)) / denom
+    idx = int(np.argmax(distances))
+    return {'knee_x': x[idx], 'knee_y': y[idx], 'knee_index': idx,
+            'distances': distances}
+
+
+def compute_knee_analysis(ablation_results,
+                          curve_key='progressive_pi_least_first', label='PI'):
+    """Compute knee-point analysis on a progressive ablation curve.
+
+    Returns dict with mean_knee, per_subject_knees, and knee_summary.
+    """
+    curve = ablation_results[curve_key]
+    # Sort by n_keep descending (62 → 1)
+    sorted_nk = sorted(curve.keys(), key=int, reverse=True)
+    x_vals = np.array([int(nk) for nk in sorted_nk])
+    mean_acc = np.array([curve[nk]['mean'] for nk in sorted_nk])
+
+    # Mean-curve knee
+    mean_knee = find_knee_point(x_vals, mean_acc)
+    mean_knee['knee_x'] = int(mean_knee['knee_x'])
+
+    # Per-subject knees
+    per_subject_knees = []
+    for subj_idx in range(N_SUBJECTS):
+        subj_acc = np.array([curve[nk]['per_subj'][subj_idx]
+                             for nk in sorted_nk])
+        sk = find_knee_point(x_vals, subj_acc)
+        per_subject_knees.append({
+            'subject': subj_idx + 1,
+            'knee_channels': int(sk['knee_x']),
+            'knee_accuracy': float(sk['knee_y']),
+        })
+
+    knee_channels = [sk['knee_channels'] for sk in per_subject_knees]
+    knee_summary = {
+        'mean': float(np.mean(knee_channels)),
+        'std': float(np.std(knee_channels)),
+        'median': float(np.median(knee_channels)),
+    }
+
+    print(f"\n  Knee-point analysis ({label} least-first):")
+    print(f"    Mean-curve knee: {mean_knee['knee_x']} channels "
+          f"(acc={mean_knee['knee_y']:.4f})")
+    print(f"    Per-subject knees: mean={knee_summary['mean']:.1f} "
+          f"+/- {knee_summary['std']:.1f}, "
+          f"median={knee_summary['median']:.0f}")
+
+    return {
+        'mean_knee': mean_knee,
+        'per_subject_knees': per_subject_knees,
+        'knee_summary': knee_summary,
+        'x_vals': x_vals,
+        'mean_acc': mean_acc,
+    }
+
+
+def run_full_ablation_study(models, data, grand_ranking, device='cuda',
+                            ig_ranking=None):
     """Run all ablation experiments. Returns dict of results."""
     all_results = {}
     all_ch = set(range(N_CHANNELS))
@@ -444,6 +527,23 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
                             'per_subj': accs}
         all_results[f'progressive_{strategy_name}'] = curve
         print(f"  Progressive {strategy_name}: done")
+
+    # Progressive ablation (IG-guided: least first, most first)
+    if ig_ranking is not None:
+        for strategy_name, ranking in [
+            ('ig_least_first', ig_ranking),
+            ('ig_most_first', ig_ranking[::-1]),
+        ]:
+            curve = {}
+            for n_keep in n_keep_steps:
+                keep = ranking[:n_keep].tolist()
+                mask = make_channel_mask(keep, batch_size=1).to(device)
+                accs = _eval_all_subjects(models, data, mask, device)
+                curve[n_keep] = {'mean': float(np.mean(accs)),
+                                 'std': float(np.std(accs)),
+                                 'per_subj': accs}
+            all_results[f'progressive_{strategy_name}'] = curve
+            print(f"  Progressive {strategy_name}: done")
 
     # Random ablation (20 repeats per step, averaged per subject first)
     curve_random = {}
@@ -574,7 +674,8 @@ def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
 # Visualization (Phase 5)
 # ────────────────────────────────────────────────────────────────────
 
-def plot_progressive_ablation_curves(results, retrain_results=None):
+def plot_progressive_ablation_curves(results, retrain_results=None,
+                                     knee_analysis=None):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
@@ -609,6 +710,15 @@ def plot_progressive_ablation_curves(results, retrain_results=None):
                         [m - s for m, s in zip(means, stds)],
                         [m + s for m, s in zip(means, stds)],
                         alpha=0.15, color=color)
+    if knee_analysis is not None:
+        mk = knee_analysis['mean_knee']
+        ax.plot(mk['knee_x'], mk['knee_y'], marker='D', color='#8e44ad',
+                markersize=10, zorder=5, label='Knee point')
+        ax.annotate(f"{mk['knee_x']}ch ({mk['knee_y']:.3f})",
+                    xy=(mk['knee_x'], mk['knee_y']),
+                    xytext=(mk['knee_x'] + 5, mk['knee_y'] - 0.06),
+                    arrowprops=dict(arrowstyle='->', color='#8e44ad', lw=1.5),
+                    fontsize=10, color='#8e44ad', fontweight='bold')
     ax.axhline(y=0.25, color='black', linestyle=':', alpha=0.5, label='Chance (4-class)')
     ax.set_xlabel('Number of Remaining Channels', fontsize=12)
     ax.set_ylabel('Accuracy', fontsize=12)
@@ -894,6 +1004,251 @@ def plot_retrain_comparison(mask_results, retrain_results):
     plt.close()
 
 
+def plot_per_subject_knee(knee_analysis):
+    """Bar chart of per-subject knee channel counts."""
+    import matplotlib.pyplot as plt
+
+    knees = knee_analysis['per_subject_knees']
+    subjects = [sk['subject'] for sk in knees]
+    channels = [sk['knee_channels'] for sk in knees]
+    mean_subj_knee = knee_analysis['knee_summary']['mean']
+    mean_curve_knee = knee_analysis['mean_knee']['knee_x']
+
+    # RdYlGn color gradient (normalize channels to [0,1] range)
+    vmin, vmax = min(channels), max(channels)
+    if vmax > vmin:
+        normed = [(c - vmin) / (vmax - vmin) for c in channels]
+    else:
+        normed = [0.5] * len(channels)
+    colors = plt.cm.RdYlGn(normed)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(range(len(subjects)), channels, color=colors, edgecolor='gray',
+           linewidth=0.5)
+    ax.axhline(y=mean_subj_knee, color='black', linestyle='--', linewidth=1.5,
+               label=f'Mean of subject knees = {mean_subj_knee:.1f}')
+    ax.axhline(y=mean_curve_knee, color='#8e44ad', linestyle=':', linewidth=1.5,
+               label=f'Mean-curve knee = {mean_curve_knee}')
+    ax.set_xticks(range(len(subjects)))
+    ax.set_xticklabels([f'S{s:02d}' for s in subjects], fontsize=9)
+    ax.set_ylabel('Knee Channel Count', fontsize=12)
+    ax.set_title('Per-Subject Optimal Channel Count (Knee Point)', fontsize=13)
+    ax.set_ylim(0, max(channels) + 5)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig('per_subject_knee.pdf', dpi=300, bbox_inches='tight')
+    print("Saved per_subject_knee.pdf")
+    plt.close()
+
+
+def plot_knee_explanation(knee_analysis, ablation_results):
+    """Two-panel diagram explaining the knee-point method."""
+    import matplotlib.pyplot as plt
+
+    curve = ablation_results['progressive_pi_least_first']
+    sorted_nk = sorted(curve.keys(), key=int, reverse=True)
+    x_vals = np.array([int(nk) for nk in sorted_nk])
+    mean_acc = np.array([curve[nk]['mean'] for nk in sorted_nk])
+    mk = knee_analysis['mean_knee']
+    distances = mk['distances']
+    knee_idx = mk['knee_index']
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left panel: curve + chord + perpendicular distances
+    ax1.plot(x_vals, mean_acc, 'o-', color='#2ecc71', linewidth=2,
+             label='PI least first')
+    # Chord line
+    ax1.plot([x_vals[0], x_vals[-1]], [mean_acc[0], mean_acc[-1]],
+             '--', color='#7f8c8d', linewidth=1.5, label='Chord')
+    # Project each point onto the chord for distance lines
+    x0, y0 = float(x_vals[0]), float(mean_acc[0])
+    x1, y1 = float(x_vals[-1]), float(mean_acc[-1])
+    dx, dy = x1 - x0, y1 - y0
+    chord_len_sq = dx ** 2 + dy ** 2
+    for i in range(len(x_vals)):
+        if distances[i] < 1e-8:
+            continue
+        # Project point onto chord to find foot of perpendicular
+        t = ((x_vals[i] - x0) * dx + (mean_acc[i] - y0) * dy) / chord_len_sq
+        foot_x = x0 + t * dx
+        foot_y = y0 + t * dy
+        color = '#e74c3c' if i == knee_idx else '#bdc3c7'
+        lw = 2.0 if i == knee_idx else 0.8
+        ax1.plot([x_vals[i], foot_x], [mean_acc[i], foot_y],
+                 color=color, linewidth=lw, alpha=0.7)
+    ax1.plot(mk['knee_x'], mk['knee_y'], 'D', color='#8e44ad',
+             markersize=12, zorder=5, label=f"Knee ({mk['knee_x']}ch)")
+    ax1.set_xlabel('Number of Remaining Channels', fontsize=12)
+    ax1.set_ylabel('Accuracy', fontsize=12)
+    ax1.set_title('Knee Detection: Max Distance to Chord', fontsize=13)
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+
+    # Right panel: bar chart of perpendicular distances
+    bar_colors = ['#e74c3c' if i == knee_idx else '#3498db'
+                  for i in range(len(x_vals))]
+    ax2.bar(range(len(x_vals)), distances, color=bar_colors, alpha=0.8)
+    ax2.set_xticks(range(len(x_vals)))
+    ax2.set_xticklabels([str(int(xv)) for xv in x_vals], fontsize=8,
+                        rotation=45)
+    ax2.set_xlabel('Number of Remaining Channels', fontsize=12)
+    ax2.set_ylabel('Perpendicular Distance', fontsize=12)
+    ax2.set_title('Distance to Chord at Each Step', fontsize=13)
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.savefig('knee_explanation.pdf', dpi=300, bbox_inches='tight')
+    print("Saved knee_explanation.pdf")
+    plt.close()
+
+
+def plot_progressive_ablation_curves_ig(results, knee_analysis_ig=None):
+    """Plot progressive ablation curves for IG-guided strategies."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+    curves_to_plot = [
+        ('progressive_ig_least_first', '#3498db', 'IG least first', '-', 'o'),
+        ('progressive_random',         '#95a5a6', 'Random',         '-', 'o'),
+        ('progressive_ig_most_first',  '#e74c3c', 'IG most first',  '-', 'o'),
+    ]
+    for key, color, label, ls, marker in curves_to_plot:
+        if key not in results:
+            continue
+        curve = results[key]
+        n_ch = sorted(curve.keys(), key=int)
+        x_vals = [int(n) for n in n_ch]
+        means = [curve[n]['mean'] for n in n_ch]
+        stds = [curve[n]['std'] for n in n_ch]
+        ax.plot(x_vals, means, marker=marker, color=color, label=label,
+                linewidth=2, linestyle=ls)
+        ax.fill_between(x_vals,
+                        [m - s for m, s in zip(means, stds)],
+                        [m + s for m, s in zip(means, stds)],
+                        alpha=0.15, color=color)
+    if knee_analysis_ig is not None:
+        mk = knee_analysis_ig['mean_knee']
+        ax.plot(mk['knee_x'], mk['knee_y'], marker='D', color='#8e44ad',
+                markersize=10, zorder=5, label='Knee point')
+        ax.annotate(f"{mk['knee_x']}ch ({mk['knee_y']:.3f})",
+                    xy=(mk['knee_x'], mk['knee_y']),
+                    xytext=(mk['knee_x'] + 5, mk['knee_y'] - 0.06),
+                    arrowprops=dict(arrowstyle='->', color='#8e44ad', lw=1.5),
+                    fontsize=10, color='#8e44ad', fontweight='bold')
+    ax.axhline(y=0.25, color='black', linestyle=':', alpha=0.5,
+               label='Chance (4-class)')
+    ax.set_xlabel('Number of Remaining Channels', fontsize=12)
+    ax.set_ylabel('Accuracy', fontsize=12)
+    ax.set_title('Progressive Electrode Ablation (IG-Guided)', fontsize=14)
+    ax.legend(fontsize=9)
+    ax.set_xlim(0, 65)
+    ax.set_ylim(0.2, 0.85)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('progressive_ablation_ig.pdf', dpi=300, bbox_inches='tight')
+    print("Saved progressive_ablation_ig.pdf")
+    plt.close()
+
+
+def plot_knee_explanation_ig(knee_analysis_ig, ablation_results):
+    """Two-panel diagram explaining the IG knee-point method."""
+    import matplotlib.pyplot as plt
+
+    curve = ablation_results['progressive_ig_least_first']
+    sorted_nk = sorted(curve.keys(), key=int, reverse=True)
+    x_vals = np.array([int(nk) for nk in sorted_nk])
+    mean_acc = np.array([curve[nk]['mean'] for nk in sorted_nk])
+    mk = knee_analysis_ig['mean_knee']
+    distances = mk['distances']
+    knee_idx = mk['knee_index']
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left panel: curve + chord + perpendicular distances
+    ax1.plot(x_vals, mean_acc, 'o-', color='#3498db', linewidth=2,
+             label='IG least first')
+    ax1.plot([x_vals[0], x_vals[-1]], [mean_acc[0], mean_acc[-1]],
+             '--', color='#7f8c8d', linewidth=1.5, label='Chord')
+    x0, y0 = float(x_vals[0]), float(mean_acc[0])
+    x1, y1 = float(x_vals[-1]), float(mean_acc[-1])
+    dx, dy = x1 - x0, y1 - y0
+    chord_len_sq = dx ** 2 + dy ** 2
+    for i in range(len(x_vals)):
+        if distances[i] < 1e-8:
+            continue
+        t = ((x_vals[i] - x0) * dx + (mean_acc[i] - y0) * dy) / chord_len_sq
+        foot_x = x0 + t * dx
+        foot_y = y0 + t * dy
+        color = '#e74c3c' if i == knee_idx else '#bdc3c7'
+        lw = 2.0 if i == knee_idx else 0.8
+        ax1.plot([x_vals[i], foot_x], [mean_acc[i], foot_y],
+                 color=color, linewidth=lw, alpha=0.7)
+    ax1.plot(mk['knee_x'], mk['knee_y'], 'D', color='#8e44ad',
+             markersize=12, zorder=5, label=f"Knee ({mk['knee_x']}ch)")
+    ax1.set_xlabel('Number of Remaining Channels', fontsize=12)
+    ax1.set_ylabel('Accuracy', fontsize=12)
+    ax1.set_title('IG Knee Detection: Max Distance to Chord', fontsize=13)
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+
+    # Right panel: bar chart of perpendicular distances
+    bar_colors = ['#e74c3c' if i == knee_idx else '#3498db'
+                  for i in range(len(x_vals))]
+    ax2.bar(range(len(x_vals)), distances, color=bar_colors, alpha=0.8)
+    ax2.set_xticks(range(len(x_vals)))
+    ax2.set_xticklabels([str(int(xv)) for xv in x_vals], fontsize=8,
+                        rotation=45)
+    ax2.set_xlabel('Number of Remaining Channels', fontsize=12)
+    ax2.set_ylabel('Perpendicular Distance', fontsize=12)
+    ax2.set_title('Distance to Chord at Each Step', fontsize=13)
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.savefig('knee_explanation_ig.pdf', dpi=300, bbox_inches='tight')
+    print("Saved knee_explanation_ig.pdf")
+    plt.close()
+
+
+def plot_per_subject_knee_ig(knee_analysis_ig):
+    """Bar chart of per-subject knee channel counts (IG-based)."""
+    import matplotlib.pyplot as plt
+
+    knees = knee_analysis_ig['per_subject_knees']
+    subjects = [sk['subject'] for sk in knees]
+    channels = [sk['knee_channels'] for sk in knees]
+    mean_subj_knee = knee_analysis_ig['knee_summary']['mean']
+    mean_curve_knee = knee_analysis_ig['mean_knee']['knee_x']
+
+    vmin, vmax = min(channels), max(channels)
+    if vmax > vmin:
+        normed = [(c - vmin) / (vmax - vmin) for c in channels]
+    else:
+        normed = [0.5] * len(channels)
+    colors = plt.cm.RdYlGn(normed)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(range(len(subjects)), channels, color=colors, edgecolor='gray',
+           linewidth=0.5)
+    ax.axhline(y=mean_subj_knee, color='black', linestyle='--', linewidth=1.5,
+               label=f'Mean of subject knees = {mean_subj_knee:.1f}')
+    ax.axhline(y=mean_curve_knee, color='#8e44ad', linestyle=':', linewidth=1.5,
+               label=f'Mean-curve knee = {mean_curve_knee}')
+    ax.set_xticks(range(len(subjects)))
+    ax.set_xticklabels([f'S{s:02d}' for s in subjects], fontsize=9)
+    ax.set_ylabel('Knee Channel Count', fontsize=12)
+    ax.set_title('Per-Subject Optimal Channel Count (IG Knee Point)',
+                 fontsize=13)
+    ax.set_ylim(0, max(channels) + 5)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig('per_subject_knee_ig.pdf', dpi=300, bbox_inches='tight')
+    print("Saved per_subject_knee_ig.pdf")
+    plt.close()
+
+
 # ────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ────────────────────────────────────────────────────────────────────
@@ -1087,7 +1442,8 @@ if __name__ == '__main__':
     for seed_idx in range(n_seeds):
         print(f"  Ablation with seed {seed_idx + 1} models...")
         abl_k = run_full_ablation_study(
-            all_seed_models[seed_idx], data, grand_ranking, device)
+            all_seed_models[seed_idx], data, grand_ranking, device,
+            ig_ranking=grand_ig_ranking)
         all_seed_ablations.append(abl_k)
 
     # Average ablation results across seeds
@@ -1104,6 +1460,7 @@ if __name__ == '__main__':
                 curve[nk] = {
                     'mean': float(np.mean(avg_per_subj)),
                     'std': float(np.std(avg_per_subj)),
+                    'per_subj': avg_per_subj,
                 }
             ablation_results[key] = curve
         else:
@@ -1126,7 +1483,9 @@ if __name__ == '__main__':
 
     # ── Phase 5: Visualization & statistics ──
     print("\n=== Phase 5: Visualization ===")
-    plot_progressive_ablation_curves(ablation_results, retrain_ablation_results)
+    knee_analysis = compute_knee_analysis(ablation_results)
+    plot_progressive_ablation_curves(ablation_results, retrain_ablation_results,
+                                     knee_analysis)
     plot_topographic_importance(grand_importance)
     plot_topographic_importance(grand_ig_importance,
                                 title='Integrated Gradients Importance (Grand Average)',
@@ -1136,6 +1495,14 @@ if __name__ == '__main__':
     plot_per_emotion_topomap(grand_emotion_imp)
     plot_ablation_summary_heatmap(ablation_results)
     plot_per_subject_accuracy(sognn_results)
+    plot_knee_explanation(knee_analysis, ablation_results)
+    plot_per_subject_knee(knee_analysis)
+
+    knee_analysis_ig = compute_knee_analysis(
+        ablation_results, 'progressive_ig_least_first', 'IG')
+    plot_progressive_ablation_curves_ig(ablation_results, knee_analysis_ig)
+    plot_knee_explanation_ig(knee_analysis_ig, ablation_results)
+    plot_per_subject_knee_ig(knee_analysis_ig)
 
     if retrain_ablation_results is not None:
         plot_retrain_comparison(ablation_results, retrain_ablation_results)
@@ -1187,6 +1554,24 @@ if __name__ == '__main__':
         'grand_ig_ranking': grand_ig_ranking.tolist(),
         'ig_importance_std': ig_importance_std.tolist(),
         'ablation': ablation_results,
+        'knee_analysis': {
+            'mean_knee_channels': int(knee_analysis['mean_knee']['knee_x']),
+            'mean_knee_accuracy': float(knee_analysis['mean_knee']['knee_y']),
+            'per_subject_knee_channels': [sk['knee_channels']
+                                          for sk in knee_analysis['per_subject_knees']],
+            'mean_of_subject_knees': knee_analysis['knee_summary']['mean'],
+            'std_of_subject_knees': knee_analysis['knee_summary']['std'],
+            'median_of_subject_knees': knee_analysis['knee_summary']['median'],
+        },
+        'knee_analysis_ig': {
+            'mean_knee_channels': int(knee_analysis_ig['mean_knee']['knee_x']),
+            'mean_knee_accuracy': float(knee_analysis_ig['mean_knee']['knee_y']),
+            'per_subject_knee_channels': [sk['knee_channels']
+                                          for sk in knee_analysis_ig['per_subject_knees']],
+            'mean_of_subject_knees': knee_analysis_ig['knee_summary']['mean'],
+            'std_of_subject_knees': knee_analysis_ig['knee_summary']['std'],
+            'median_of_subject_knees': knee_analysis_ig['knee_summary']['median'],
+        },
         'model_kwargs': model_kwargs,
         'train_kwargs': train_kwargs,
     }
