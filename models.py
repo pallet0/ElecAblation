@@ -5,154 +5,70 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class _ChannelBN(nn.Module):
-    """BatchNorm1d for (B, C, D) tensors — normalizes each D feature across B*C."""
-    def __init__(self, d):
-        super().__init__()
-        self.bn = nn.BatchNorm1d(d)
-    def forward(self, x):
-        B, C, D = x.shape
-        return self.bn(x.reshape(B * C, D)).reshape(B, C, D)
+class SOGC(nn.Module):
+    """Self-Organized Graph Convolution layer (Li et al., 2021).
 
+    Computes a sparse adjacency matrix from node features via bottleneck
+    projection + tanh + softmax + top-k, adds self-loops (matching
+    DenseGCNConv's add_loop=True default), then applies graph convolution.
 
-class ChannelAttentionEEGNet(nn.Module):
-    """Shared spectral encoder + Bahdanau attention + classifier.
-
-    Input:  (B, C, n_bands)
-    Output: (logits (B, n_classes), alpha (B, C))
+    Args:
+        n_electrodes: number of graph nodes (electrodes)
+        in_features: flattened feature dim per node (C*H*W from CNN)
+        bn_features: bottleneck dim for adjacency computation
+        out_features: output feature dim per node
+        top_k: number of neighbors to keep in sparse adjacency
     """
 
-    def __init__(self, n_bands=5, n_classes=4, d_hidden=64, dropout=0.5,
-                 n_channels=62):
+    def __init__(self, n_electrodes, in_features, bn_features, out_features, top_k):
         super().__init__()
-        self.spectral_encoder = nn.Sequential(
-            nn.Linear(n_bands, d_hidden),
-            _ChannelBN(d_hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_hidden, d_hidden),
-            _ChannelBN(d_hidden),
-            nn.GELU(),
-        )
-        self.channel_embedding = nn.Parameter(
-            torch.randn(1, n_channels, d_hidden) * 0.02)
-        self.attn_scorer = nn.Sequential(
-            nn.Linear(d_hidden, d_hidden // 2),
-            nn.Tanh(),
-            nn.Linear(d_hidden // 2, 1, bias=False),
-        )
-        self.classifier = nn.Sequential(
-            nn.BatchNorm1d(d_hidden),
-            nn.Dropout(dropout),
-            nn.Linear(d_hidden, d_hidden),
-            nn.GELU(),
-            nn.Linear(d_hidden, n_classes),
-        )
-
-    def forward(self, x, channel_mask=None):
-        h = self.spectral_encoder(x) + self.channel_embedding  # (B, C, d_hidden)
-        # Bahdanau attention pooling
-        e = self.attn_scorer(h).squeeze(-1)         # (B, C)
-        if channel_mask is not None:
-            e = e.masked_fill(channel_mask == 0, float('-inf'))
-        alpha = F.softmax(e, dim=-1)                # (B, C)
-        context = torch.einsum('bc,bcd->bd', alpha, h)
-        logits = self.classifier(context)
-        return logits, alpha
-
-    @torch.no_grad()
-    def get_channel_importance(self, dataloader, device='cuda'):
-        self.eval()
-        all_alpha = []
-        for x, _ in dataloader:
-            x = x.to(device)
-            _, alpha = self.forward(x)
-            all_alpha.append(alpha.cpu())
-        mean_alpha = torch.cat(all_alpha, dim=0).mean(dim=0)
-        ranking = mean_alpha.argsort(descending=True)
-        return mean_alpha.numpy(), ranking.numpy()
-
-
-class MLPBaseline(nn.Module):
-    """310 -> 4 MLP with BatchNorm + ReLU + Dropout."""
-
-    def __init__(self, input_dim=310, n_classes=4, h1=128, h2=64, dropout=0.5):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, h1),
-            nn.BatchNorm1d(h1),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(h1, h2),
-            nn.BatchNorm1d(h2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(h2, n_classes),
-        )
+        self.n_electrodes = n_electrodes
+        self.top_k = min(top_k, n_electrodes)
+        self.bn = nn.Linear(in_features, bn_features)
+        self.gc = nn.Linear(in_features, out_features)
 
     def forward(self, x):
-        return self.net(x)
+        """
+        Args:
+            x: (B*E, C, H, W) feature maps from CNN stage
+        Returns:
+            (B, E, out_features) graph-convolved node features
+        """
+        B_E = x.shape[0]
+        E = self.n_electrodes
+        B = B_E // E
 
+        # Flatten spatial dims: (B*E, C, H, W) -> (B, E, C*H*W)
+        h = x.reshape(B, E, -1)
 
-class DualAttentionEEGNet(nn.Module):
-    """Band attention -> Channel attention -> Classifier.
+        # Compute adjacency: bottleneck -> tanh -> softmax -> top-k
+        g = torch.tanh(self.bn(h))                                # (B, E, bn)
+        a = torch.softmax(g @ g.transpose(-1, -2), dim=-1)       # (B, E, E)
 
-    Input:  (B, C, n_bands)
-    Output: (logits (B, n_classes), channel_alpha (B, C), band_alpha (B, C, n_bands))
-    """
+        # Top-k sparsification
+        vals, idxs = a.topk(self.top_k, dim=-1)                  # (B, E, k)
+        a_sparse = torch.zeros_like(a).scatter_(-1, idxs, vals)   # (B, E, E)
 
-    def __init__(self, n_bands=5, n_classes=4, d_band=16, d_chan=64, dropout=0.5):
-        super().__init__()
-        self.band_embed = nn.Sequential(
-            nn.Linear(1, d_band),
-            nn.GELU(),
-        )
-        self.band_attn = nn.Sequential(
-            nn.Linear(d_band, d_band // 2),
-            nn.Tanh(),
-            nn.Linear(d_band // 2, 1, bias=False),
-        )
-        self.channel_proj = nn.Sequential(
-            nn.Linear(d_band, d_chan),
-            nn.LayerNorm(d_chan),
-            nn.GELU(),
-        )
-        self.chan_attn = nn.Sequential(
-            nn.Linear(d_chan, d_chan // 2),
-            nn.Tanh(),
-            nn.Linear(d_chan // 2, 1, bias=False),
-        )
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(d_chan),
-            nn.Linear(d_chan, d_chan),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_chan, n_classes),
-        )
+        # Add self-loops: set diagonal to 1.0
+        eye = torch.eye(E, device=a.device, dtype=a.dtype).unsqueeze(0)
+        a_sparse = a_sparse * (1 - eye) + eye
 
-    def forward(self, x, channel_mask=None):
-        B, C, nb = x.shape
-        h_band = self.band_embed(x.unsqueeze(-1))      # (B, C, nb, d_band)
-        e_band = self.band_attn(h_band).squeeze(-1)     # (B, C, nb)
-        beta = F.softmax(e_band, dim=-1)                 # (B, C, nb)
-        h_chan = torch.einsum('bcn,bcnd->bcd', beta, h_band)  # (B, C, d_band)
-        h_chan = self.channel_proj(h_chan)                # (B, C, d_chan)
-        e_chan = self.chan_attn(h_chan).squeeze(-1)        # (B, C)
-        if channel_mask is not None:
-            e_chan = e_chan.masked_fill(channel_mask == 0, float('-inf'))
-        alpha = F.softmax(e_chan, dim=-1)                # (B, C)
-        context = torch.einsum('bc,bcd->bd', alpha, h_chan)
-        logits = self.classifier(context)
-        return logits, alpha, beta
+        # Graph convolution
+        out = torch.relu(self.gc(a_sparse @ h))                   # (B, E, out)
+        return out
 
 
 class SOGNN(nn.Module):
     """Self-Organized Graph Neural Network for EEG emotion classification.
 
-    Architecture (Li et al., 2021):
-      1. Per-electrode conv-pool chain: (B, E, 5, T) -> (B, E, 512) node features
-      2. Three self-organized graph convolution (SOGC) layers: 512->64->64->64
-      3. Flatten + FC: (B, E*64) -> (B, n_classes)
+    Architecture (Li et al., 2021) — interleaved CNN + SOGC with multi-scale
+    parallel branches:
+
+      Input (B, E, 5, 64) -> reshape (B*E, 1, 5, 64)
+        -> Conv1 -> ReLU -> Drop -> Pool -> SOGC1 -> x1 (B, E, 32)
+        -> Conv2 -> ReLU -> Drop -> Pool -> SOGC2 -> x2 (B, E, 32)
+        -> Conv3 -> ReLU -> Drop -> Pool -> SOGC3 -> x3 (B, E, 32)
+        -> cat([x1, x2, x3]) -> Drop -> flatten -> Linear -> logits
 
     Args:
         n_electrodes: number of EEG electrodes (62 default, variable for retrain ablation)
@@ -160,74 +76,40 @@ class SOGNN(nn.Module):
         n_timeframes: temporal padding length (64 default)
         n_classes: number of output classes (4 for SEED-IV)
         top_k: number of neighbors to keep in sparse adjacency
-        dropout: dropout rate for conv blocks and FC layer
-        **kwargs: absorbs extra keys from HP search dicts
+        dropout: dropout rate
+        **kwargs: absorbs extra keys
     """
 
     def __init__(self, n_electrodes=62, n_bands=5, n_timeframes=64,
                  n_classes=4, top_k=10, dropout=0.1, **kwargs):
         super().__init__()
         self.n_electrodes = n_electrodes
-        self.top_k = min(top_k, n_electrodes)
 
-        # ── Per-electrode conv-pool chain ──
-        # Input per electrode: (1, 5, T) -> after 3 blocks -> (128, 1, T')
-        self.conv_pool = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=(5, 5), padding=0),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.MaxPool2d(kernel_size=(1, 2)),
+        # CNN blocks (applied per-electrode)
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=(5, 5))
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=(1, 5))
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=(1, 5))
 
-            nn.Conv2d(32, 64, kernel_size=(1, 5), padding=0),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.MaxPool2d(kernel_size=(1, 2)),
+        self.pool = nn.MaxPool2d(kernel_size=(1, 2))
+        self.drop = nn.Dropout(dropout)
 
-            nn.Conv2d(64, 128, kernel_size=(1, 5), padding=0),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.MaxPool2d(kernel_size=(1, 2)),
-        )
-
-        # Compute conv-pool output dim dynamically
+        # Compute intermediate feature dimensions dynamically
         with torch.no_grad():
             dummy = torch.zeros(1, 1, n_bands, n_timeframes)
-            conv_out = self.conv_pool(dummy)
-            self._node_feat_dim = conv_out.numel()  # 128 * 1 * 4 = 512 for (5, 64)
+            d1 = self.pool(F.relu(self.conv1(dummy)))
+            sogc1_in = d1.numel()       # 32 * 1 * 30 = 960 for (5, 64)
+            d2 = self.pool(F.relu(self.conv2(d1)))
+            sogc2_in = d2.numel()       # 64 * 1 * 13 = 832 for (5, 64)
+            d3 = self.pool(F.relu(self.conv3(d2)))
+            sogc3_in = d3.numel()       # 128 * 1 * 4 = 512 for (5, 64)
 
-        # ── SOGC layers (3 sequential) ──
-        d_bn = 32  # bottleneck dim for adjacency computation
-        # Layer 1: 512 -> 64
-        self.W_bn1 = nn.Linear(self._node_feat_dim, d_bn, bias=False)
-        self.gc1 = nn.Linear(self._node_feat_dim, 64)
-        # Layer 2: 64 -> 64
-        self.W_bn2 = nn.Linear(64, d_bn, bias=False)
-        self.gc2 = nn.Linear(64, 64)
-        # Layer 3: 64 -> 64
-        self.W_bn3 = nn.Linear(64, d_bn, bias=False)
-        self.gc3 = nn.Linear(64, 64)
+        # SOGC branches (multi-scale graph reasoning)
+        self.sogc1 = SOGC(n_electrodes, sogc1_in, 64, 32, top_k)
+        self.sogc2 = SOGC(n_electrodes, sogc2_in, 64, 32, top_k)
+        self.sogc3 = SOGC(n_electrodes, sogc3_in, 64, 32, top_k)
 
-        # ── Flatten + FC ──
-        self._graph_out_dim = 64
-        self.classifier = nn.Linear(n_electrodes * self._graph_out_dim, n_classes)
-
-    def _sogc(self, H, W_bn, gc_layer):
-        """One self-organized graph convolution step.
-
-        Args:
-            H: node features (B, E, D_in)
-            W_bn: bottleneck linear layer (D_in -> d_bn)
-            gc_layer: graph conv linear layer (D_in -> D_out)
-        Returns:
-            H_out: (B, E, D_out)
-        """
-        G = torch.tanh(W_bn(H))                                # (B, E, d_bn)
-        A = torch.softmax(G @ G.transpose(-1, -2), dim=-1)     # (B, E, E)
-        # Top-k sparsification (no re-normalization)
-        vals, idxs = A.topk(self.top_k, dim=-1)                # (B, E, k)
-        A_sparse = torch.zeros_like(A).scatter_(-1, idxs, vals) # (B, E, E)
-        H_out = torch.relu(gc_layer(A_sparse @ H))             # (B, E, D_out)
-        return H_out
+        # Classifier: multi-scale concat -> logits
+        self.classifier = nn.Linear(n_electrodes * 32 * 3, n_classes)
 
     def forward(self, x):
         """
@@ -238,17 +120,24 @@ class SOGNN(nn.Module):
         """
         B, E = x.shape[0], x.shape[1]
 
-        # Per-electrode conv-pool: reshape to (B*E, 1, bands, T)
+        # Reshape to per-electrode: (B*E, 1, bands, T)
         x = x.reshape(B * E, 1, x.shape[2], x.shape[3])
-        x = self.conv_pool(x)                        # (B*E, 128, 1, T')
-        x = x.reshape(B, E, -1)                      # (B, E, 512) node features
 
-        # 3 SOGC layers
-        x = self._sogc(x, self.W_bn1, self.gc1)      # (B, E, 64)
-        x = self._sogc(x, self.W_bn2, self.gc2)      # (B, E, 64)
-        x = self._sogc(x, self.W_bn3, self.gc3)      # (B, E, 64)
+        # Block 1 + SOGC1 branch
+        x = self.pool(self.drop(F.relu(self.conv1(x))))
+        x1 = self.sogc1(x)                              # (B, E, 32)
 
-        # Flatten + classify
-        x = x.reshape(B, -1)                          # (B, E * 64)
-        logits = self.classifier(x)                   # (B, n_classes)
+        # Block 2 + SOGC2 branch
+        x = self.pool(self.drop(F.relu(self.conv2(x))))
+        x2 = self.sogc2(x)                              # (B, E, 32)
+
+        # Block 3 + SOGC3 branch
+        x = self.pool(self.drop(F.relu(self.conv3(x))))
+        x3 = self.sogc3(x)                              # (B, E, 32)
+
+        # Multi-scale concat + classify
+        out = torch.cat([x1, x2, x3], dim=-1)           # (B, E, 96)
+        out = self.drop(out)
+        out = out.reshape(B, -1)                         # (B, E * 96)
+        logits = self.classifier(out)                    # (B, n_classes)
         return logits

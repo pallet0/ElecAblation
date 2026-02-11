@@ -190,7 +190,7 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
             train_auc = compute_training_auc(model, tr_loader, device)
             epoch_bar.set_postfix(train=f'{train_acc:.4f}',
                                   auc=f'{train_auc:.4f}')
-            if train_auc >= auc_threshold:
+            if train_auc >= auc_threshold and train_acc > 0.90:
                 break
         epoch_bar.close()
 
@@ -350,9 +350,9 @@ def _retrain_loso(data, channel_indices, model_kwargs, train_kwargs, device):
         criterion = nn.CrossEntropyLoss()
         auc_threshold = train_kwargs.get('auc_threshold', 0.99)
         for epoch in range(train_kwargs['max_epochs']):
-            train_one_epoch(model, tr_loader, optimizer, criterion, device)
+            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device)
             train_auc = compute_training_auc(model, tr_loader, device)
-            if train_auc >= auc_threshold:
+            if train_auc >= auc_threshold and train_acc > 0.90:
                 break
         accs.append(evaluate(model, te_loader, device))
     return accs
