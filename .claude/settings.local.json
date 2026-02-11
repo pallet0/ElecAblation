@@ -31,7 +31,11 @@
       "mcp__plugin_serena_serena__read_memory",
       "mcp__plugin_serena_serena__write_memory",
       "mcp__plugin_serena_serena__list_memories",
-      "WebFetch(domain:public-pages-files-2025.frontiersin.org)"
+      "WebFetch(domain:public-pages-files-2025.frontiersin.org)",
+      "WebFetch(domain:christophm.github.io)",
+      "WebFetch(domain:eli5.readthedocs.io)",
+      "WebFetch(domain:rasbt.github.io)",
+      "WebFetch(domain:www.mathworks.com)"
     ]
   }
 }

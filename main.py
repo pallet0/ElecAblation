@@ -209,10 +209,12 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
 
 @torch.no_grad()
 def permutation_importance(model, X, y, device, n_repeats=10):
-    """Compute permutation importance for each channel (loss-based).
+    """Compute permutation importance for each channel (loss-based and accuracy-based).
 
-    Uses cross-entropy loss instead of accuracy for continuous, tie-free
-    importance values. Positive = important (shuffling increases loss).
+    Uses cross-entropy loss and accuracy simultaneously from the same forward
+    passes — zero extra cost. Both metrics: positive = important.
+      - Loss PI: shuffling increases loss
+      - Accuracy PI: shuffling decreases accuracy (baseline_acc - shuffled_acc)
 
     Args:
         model: trained SOGNN
@@ -220,42 +222,50 @@ def permutation_importance(model, X, y, device, n_repeats=10):
         y: numpy array (N,)
         device: torch device
         n_repeats: number of shuffle repeats per channel
-    Returns: (C,) array where positive = important (shuffling hurts loss)
+    Returns: (loss_imp, acc_imp) tuple of (C,) arrays, both positive = important
     """
     model.eval()
     X_t = torch.tensor(X, dtype=torch.float32, device=device)
     y_t = torch.tensor(y, dtype=torch.long, device=device)
     N = X_t.size(0)
-    # Baseline loss
+    # Baseline loss and accuracy
     logits = model(X_t)
     baseline_loss = F.cross_entropy(logits, y_t).item()
+    baseline_acc = (logits.argmax(1) == y_t).float().mean().item()
     n_channels = X.shape[1]
-    importances = np.zeros(n_channels)
+    loss_importances = np.zeros(n_channels)
+    acc_importances = np.zeros(n_channels)
     for ch in range(n_channels):
         shuffled_losses = []
+        shuffled_accs = []
         for _ in range(n_repeats):
             X_perm = X_t.clone()
             perm_idx = torch.randperm(N, device=device)
             X_perm[:, ch, :, :] = X_perm[perm_idx, ch, :, :]
             logits = model(X_perm)
-            loss = F.cross_entropy(logits, y_t).item()
-            shuffled_losses.append(loss)
-        importances[ch] = float(np.mean(shuffled_losses)) - baseline_loss
-    return importances
+            shuffled_losses.append(F.cross_entropy(logits, y_t).item())
+            shuffled_accs.append((logits.argmax(1) == y_t).float().mean().item())
+        loss_importances[ch] = float(np.mean(shuffled_losses)) - baseline_loss
+        acc_importances[ch] = baseline_acc - float(np.mean(shuffled_accs))
+    return loss_importances, acc_importances
 
 
 @torch.no_grad()
 def per_emotion_permutation_importance(model, X, y, device,
                                         n_repeats=10, n_classes=N_CLASSES):
-    """Permutation importance per emotion class. Returns {class_id: (62,) array}."""
-    result = {}
+    """Permutation importance per emotion class.
+    Returns (loss_dict, acc_dict), each {class_id: (62,) array}."""
+    loss_result = {}
+    acc_result = {}
     for c in range(n_classes):
         mask_c = (y == c)
         if mask_c.sum() == 0:
             continue
-        result[c] = permutation_importance(model, X[mask_c], y[mask_c],
-                                            device, n_repeats=n_repeats)
-    return result
+        loss_imp, acc_imp = permutation_importance(model, X[mask_c], y[mask_c],
+                                                    device, n_repeats=n_repeats)
+        loss_result[c] = loss_imp
+        acc_result[c] = acc_imp
+    return loss_result, acc_result
 
 
 def integrated_gradients_importance(model, X, y, device, n_steps=50,
@@ -359,7 +369,8 @@ def _retrain_loso(data, channel_indices, model_kwargs, train_kwargs, device):
     return accs
 
 
-def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
+def run_full_ablation_study(models, data, grand_ranking, device='cuda',
+                           grand_acc_ranking=None):
     """Run all ablation experiments. Returns dict of results."""
     all_results = {}
     all_ch = set(range(N_CHANNELS))
@@ -447,6 +458,22 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
                             'per_subj': accs}
         all_results[f'progressive_{strategy_name}'] = curve
         print(f"  Progressive {strategy_name}: done")
+
+    # Progressive ablation (Accuracy-PI-guided: least first, most first)
+    if grand_acc_ranking is not None:
+        for strategy_name, ranking in [
+            ('acc_pi_least_first', grand_acc_ranking),
+            ('acc_pi_most_first', grand_acc_ranking[::-1]),
+        ]:
+            curve = {}
+            for n_keep in n_keep_steps:
+                keep = ranking[:n_keep].tolist()
+                mask = make_channel_mask(keep, batch_size=1).to(device)
+                accs = _eval_all_subjects(models, data, mask, device)
+                curve[n_keep] = {'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
+                                'per_subj': accs}
+            all_results[f'progressive_{strategy_name}'] = curve
+            print(f"  Progressive {strategy_name}: done")
 
     # Random ablation (20 repeats per step, averaged per subject first)
     curve_random = {}
@@ -582,9 +609,11 @@ def plot_progressive_ablation_curves(results, retrain_results=None):
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
     curves_to_plot = [
-        ('progressive_pi_least_first', '#2ecc71', 'PI least important first', '-', 'o'),
-        ('progressive_random',         '#95a5a6', 'Random',                   '-', 'o'),
-        ('progressive_pi_most_first',  '#e74c3c', 'PI most important first',  '-', 'o'),
+        ('progressive_pi_least_first', '#2ecc71', 'Loss-PI least first', '-', 'o'),
+        ('progressive_random',         '#95a5a6', 'Random',              '-', 'o'),
+        ('progressive_pi_most_first',  '#e74c3c', 'Loss-PI most first', '-', 'o'),
+        ('progressive_acc_pi_least_first', '#27ae60', 'Acc-PI least first', '-.', 's'),
+        ('progressive_acc_pi_most_first',  '#c0392b', 'Acc-PI most first',  '-.', 's'),
     ]
     if retrain_results is not None:
         curves_to_plot.extend([
@@ -657,6 +686,34 @@ def plot_topographic_importance(grand_importance,
     ax.set_title(title, fontsize=13)
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"Saved {filename}")
+    plt.close()
+
+
+def plot_cumulative_topomaps(all_seed_arrays, seed_idx, metric_name):
+    """Plot cumulative topomap averaging seeds 0..seed_idx.
+
+    Args:
+        all_seed_arrays: list of (N_SUBJECTS, N_CHANNELS) arrays, length >= seed_idx+1
+        seed_idx: 0-based index of current seed
+        metric_name: e.g. 'pi_loss', 'pi_acc', 'ig'
+    """
+    import matplotlib.pyplot as plt
+    import mne
+    info, picks = _make_topo_info()
+    # Cumulative grand average: mean across subjects per seed, then across seeds
+    cumulative = np.array(
+        [arr.mean(axis=0) for arr in all_seed_arrays[:seed_idx + 1]])
+    grand = cumulative.mean(axis=0)
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    mne.viz.plot_topomap(grand[picks], info, axes=ax, show=False,
+                         cmap='RdYlBu_r', contours=0, extrapolate='head',
+                         outlines='head', sensors=True)
+    n_seeds_so_far = seed_idx + 1
+    ax.set_title(f'{metric_name} — cumulative avg (seeds 1-{n_seeds_so_far})',
+                 fontsize=13)
+    fname = f'cumulative_{metric_name}_seed{n_seeds_so_far}.pdf'
+    plt.savefig(fname, dpi=300, bbox_inches='tight')
+    print(f"Saved {fname}")
     plt.close()
 
 
@@ -746,7 +803,9 @@ def plot_lobe_ablation_table(results):
     plt.close()
 
 
-def plot_per_emotion_topomap(emotion_importances):
+def plot_per_emotion_topomap(emotion_importances,
+                            title='Per-Emotion Permutation Importance (rank-normalized)',
+                            filename='per_emotion_topomap.pdf'):
     import matplotlib.pyplot as plt
     import mne
     from scipy.stats import rankdata
@@ -762,11 +821,10 @@ def plot_per_emotion_topomap(emotion_importances):
                              vlim=(0, 1), extrapolate='head',
                              outlines='head', sensors=True)
         axes[c].set_title(emotion_labels.get(c, str(c)), fontsize=13)
-    plt.suptitle('Per-Emotion Permutation Importance (rank-normalized)',
-                 fontsize=15, y=1.02)
+    plt.suptitle(title, fontsize=15, y=1.02)
     plt.tight_layout()
-    plt.savefig('per_emotion_topomap.pdf', dpi=300, bbox_inches='tight')
-    print("Saved per_emotion_topomap.pdf")
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"Saved {filename}")
     plt.close()
 
 
@@ -864,8 +922,10 @@ if __name__ == '__main__':
     all_seed_models = []
     all_seed_results = []
     all_seed_importances = []
+    all_seed_acc_importances = []
     all_seed_ig_importances = []
     all_seed_emotion_imp = []
+    all_seed_emotion_acc_imp = []
 
     for seed_idx in range(n_seeds):
         seed = seed_idx + 1
@@ -882,15 +942,19 @@ if __name__ == '__main__':
         # Phase 3: Permutation importance (on held-out subject's ALL sessions)
         print(f"  Phase 3: Permutation importance (seed {seed})")
         imp_k = np.zeros((N_SUBJECTS, N_CHANNELS))
+        acc_imp_k = np.zeros((N_SUBJECTS, N_CHANNELS))
         pi_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'PI seed {seed}')
         for subj in pi_bar:
             X_test = np.concatenate([data[subj][sess][0]
                                      for sess in range(1, N_SESSIONS + 1)])
             y_test = np.concatenate([data[subj][sess][1]
                                      for sess in range(1, N_SESSIONS + 1)])
-            imp_k[subj - 1] = permutation_importance(
+            loss_imp, acc_imp = permutation_importance(
                 models_k[subj], X_test, y_test, device, n_repeats=10)
+            imp_k[subj - 1] = loss_imp
+            acc_imp_k[subj - 1] = acc_imp
         all_seed_importances.append(imp_k)
+        all_seed_acc_importances.append(acc_imp_k)
 
         # Phase 3b: Integrated Gradients importance
         print(f"  Phase 3b: Integrated Gradients (seed {seed})")
@@ -907,25 +971,36 @@ if __name__ == '__main__':
 
         # Per-emotion PI
         emo_k = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
+        emo_acc_k = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
         emo_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'Emo-PI seed {seed}')
         for subj in emo_bar:
             X_test = np.concatenate([data[subj][sess][0]
                                      for sess in range(1, N_SESSIONS + 1)])
             y_test = np.concatenate([data[subj][sess][1]
                                      for sess in range(1, N_SESSIONS + 1)])
-            subj_emo = per_emotion_permutation_importance(
+            subj_emo_loss, subj_emo_acc = per_emotion_permutation_importance(
                 models_k[subj], X_test, y_test, device, n_repeats=10)
-            for c in subj_emo:
-                emo_k[c] += subj_emo[c]
+            for c in subj_emo_loss:
+                emo_k[c] += subj_emo_loss[c]
+            for c in subj_emo_acc:
+                emo_acc_k[c] += subj_emo_acc[c]
         for c in emo_k:
             emo_k[c] /= N_SUBJECTS
+        for c in emo_acc_k:
+            emo_acc_k[c] /= N_SUBJECTS
         all_seed_emotion_imp.append(emo_k)
+        all_seed_emotion_acc_imp.append(emo_acc_k)
 
         # Per-seed summary
         seed_grand = imp_k.mean(axis=0)
         seed_ranking = seed_grand.argsort()[::-1]
-        print(f"  Seed {seed} top-5 PI: "
+        print(f"  Seed {seed} top-5 PI (loss): "
               f"{[CHANNEL_NAMES[i] for i in seed_ranking[:5]]}")
+
+        # Cumulative topomaps (running average of seeds 1..current)
+        plot_cumulative_topomaps(all_seed_importances, seed_idx, 'pi_loss')
+        plot_cumulative_topomaps(all_seed_acc_importances, seed_idx, 'pi_acc')
+        plot_cumulative_topomaps(all_seed_ig_importances, seed_idx, 'ig')
 
     # ── Aggregate importance across seeds ──
     print("\n=== Aggregating across seeds ===")
@@ -938,6 +1013,15 @@ if __name__ == '__main__':
     grand_ranking = grand_importance.argsort()[::-1].copy()
     print("  Ensemble PI top-10:",
           [CHANNEL_NAMES[i] for i in grand_ranking[:10]])
+
+    # Accuracy-PI: same logic
+    seed_grand_acc_importances = np.array(
+        [imp.mean(axis=0) for imp in all_seed_acc_importances])
+    grand_acc_importance = seed_grand_acc_importances.mean(axis=0)
+    acc_importance_std = seed_grand_acc_importances.std(axis=0)
+    grand_acc_ranking = grand_acc_importance.argsort()[::-1].copy()
+    print("  Ensemble Acc-PI top-10:",
+          [CHANNEL_NAMES[i] for i in grand_acc_ranking[:10]])
 
     # IG: same logic
     seed_grand_ig = np.array(
@@ -965,6 +1049,13 @@ if __name__ == '__main__':
     for c in grand_emotion_imp:
         grand_emotion_imp[c] /= n_seeds
 
+    grand_emotion_acc_imp = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
+    for emo_acc_k in all_seed_emotion_acc_imp:
+        for c in emo_acc_k:
+            grand_emotion_acc_imp[c] += emo_acc_k[c]
+    for c in grand_emotion_acc_imp:
+        grand_emotion_acc_imp[c] /= n_seeds
+
     # ── Cross-seed stability diagnostics ──
     if n_seeds > 1:
         from scipy.stats import spearmanr
@@ -974,9 +1065,18 @@ if __name__ == '__main__':
                 rho, _ = spearmanr(seed_grand_importances[i],
                                    seed_grand_importances[j])
                 rhos.append(rho)
-        print(f"  Cross-seed PI rank stability: mean Spearman rho = "
+        print(f"  Cross-seed Loss-PI rank stability: mean Spearman rho = "
               f"{np.mean(rhos):.4f} "
               f"(min={np.min(rhos):.4f}, max={np.max(rhos):.4f})")
+        acc_rhos = []
+        for i in range(n_seeds):
+            for j in range(i + 1, n_seeds):
+                rho, _ = spearmanr(seed_grand_acc_importances[i],
+                                   seed_grand_acc_importances[j])
+                acc_rhos.append(rho)
+        print(f"  Cross-seed Acc-PI rank stability: mean Spearman rho = "
+              f"{np.mean(acc_rhos):.4f} "
+              f"(min={np.min(acc_rhos):.4f}, max={np.max(acc_rhos):.4f})")
         ig_rhos = []
         for i in range(n_seeds):
             for j in range(i + 1, n_seeds):
@@ -992,7 +1092,8 @@ if __name__ == '__main__':
     for seed_idx in range(n_seeds):
         print(f"  Ablation with seed {seed_idx + 1} models...")
         abl_k = run_full_ablation_study(
-            all_seed_models[seed_idx], data, grand_ranking, device)
+            all_seed_models[seed_idx], data, grand_ranking, device,
+            grand_acc_ranking=grand_acc_ranking)
         all_seed_ablations.append(abl_k)
 
     # Average ablation results across seeds
@@ -1039,6 +1140,12 @@ if __name__ == '__main__':
     plot_region_ablation_table(ablation_results)
     plot_lobe_ablation_table(ablation_results)
     plot_per_emotion_topomap(grand_emotion_imp)
+    plot_topographic_importance(grand_acc_importance,
+                                title='Accuracy-PI (Grand Average)',
+                                filename='topomap_importance_acc_PI.pdf')
+    plot_per_emotion_topomap(grand_emotion_acc_imp,
+                             title='Per-Emotion Accuracy-PI (rank-normalized)',
+                             filename='per_emotion_topomap_acc_PI.pdf')
 
     if retrain_ablation_results is not None:
         plot_retrain_comparison(ablation_results, retrain_ablation_results)
@@ -1086,6 +1193,9 @@ if __name__ == '__main__':
         'grand_ranking': grand_ranking.tolist(),
         'grand_importance': grand_importance.tolist(),
         'importance_std': importance_std.tolist(),
+        'grand_acc_ranking': grand_acc_ranking.tolist(),
+        'grand_acc_importance': grand_acc_importance.tolist(),
+        'acc_importance_std': acc_importance_std.tolist(),
         'grand_ig_importance': grand_ig_importance.tolist(),
         'grand_ig_ranking': grand_ig_ranking.tolist(),
         'ig_importance_std': ig_importance_std.tolist(),
