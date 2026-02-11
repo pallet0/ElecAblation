@@ -796,6 +796,71 @@ def plot_per_emotion_topomap(emotion_importances,
     plt.close()
 
 
+def plot_ablation_summary_heatmap(results):
+    """Single heatmap: rows = regions + lobes, columns = [Keep Only, Remove]."""
+    import matplotlib.pyplot as plt
+
+    regions = list(REGIONS_FINE.keys())
+    lobes = list(LOBES.keys())
+    row_labels = regions + lobes
+    n_rows = len(row_labels)
+
+    keep_means = ([results[f'keep_only_{r}']['mean'] for r in regions]
+                  + [results[f'lobe_keep_only_{l}']['mean'] for l in lobes])
+    remove_means = ([results[f'remove_{r}']['mean'] for r in regions]
+                    + [results[f'lobe_remove_{l}']['mean'] for l in lobes])
+
+    data = np.array([keep_means, remove_means]).T  # (n_rows, 2)
+
+    fig, ax = plt.subplots(figsize=(5, 8))
+    im = ax.imshow(data, cmap='RdYlGn', aspect='auto',
+                   vmin=0.20, vmax=max(0.75, data.max()))
+    for i in range(n_rows):
+        for j in range(2):
+            ax.text(j, i, f'{data[i, j]:.3f}', ha='center', va='center',
+                    fontsize=9, color='black')
+    ax.axhline(y=len(regions) - 0.5, color='white', linewidth=2)
+
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(['Keep Only', 'Remove'], fontsize=11)
+    ax.set_yticks(range(n_rows))
+    ax.set_yticklabels(row_labels, fontsize=9)
+    ax.set_title('Ablation Summary (Region & Lobe)', fontsize=13)
+    fig.colorbar(im, ax=ax, label='Accuracy', shrink=0.8)
+    plt.tight_layout()
+    plt.savefig('ablation_heatmap.pdf', dpi=300, bbox_inches='tight')
+    print("Saved ablation_heatmap.pdf")
+    plt.close()
+
+
+def plot_per_subject_accuracy(sognn_results):
+    """Bar chart of per-subject LOSO accuracy with mean line."""
+    import matplotlib.pyplot as plt
+
+    subjects = sorted(sognn_results.keys())
+    accs = [sognn_results[s] for s in subjects]
+    mean_acc = np.mean(accs)
+    colors = plt.cm.RdYlGn([(a - 0.15) / 0.6 for a in accs])
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(range(len(subjects)), accs, color=colors, edgecolor='gray',
+           linewidth=0.5)
+    ax.axhline(y=mean_acc, color='black', linestyle='--', linewidth=1.5,
+               label=f'Mean = {mean_acc:.3f}')
+    ax.axhline(y=0.25, color='red', linestyle=':', alpha=0.5, label='Chance')
+    ax.set_xticks(range(len(subjects)))
+    ax.set_xticklabels([f'S{s:02d}' for s in subjects], fontsize=9)
+    ax.set_ylabel('Accuracy')
+    ax.set_title('Per-Subject LOSO Accuracy (SOGNN)', fontsize=13)
+    ax.set_ylim(0.15, max(0.85, max(accs) + 0.05))
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig('per_subject_accuracy.pdf', dpi=300, bbox_inches='tight')
+    print("Saved per_subject_accuracy.pdf")
+    plt.close()
+
+
 def plot_retrain_comparison(mask_results, retrain_results):
     """Grouped bar chart: mask-based vs retrain accuracy for montage subsets."""
     import matplotlib.pyplot as plt
@@ -1069,6 +1134,8 @@ if __name__ == '__main__':
     plot_region_ablation_table(ablation_results)
     plot_lobe_ablation_table(ablation_results)
     plot_per_emotion_topomap(grand_emotion_imp)
+    plot_ablation_summary_heatmap(ablation_results)
+    plot_per_subject_accuracy(sognn_results)
 
     if retrain_ablation_results is not None:
         plot_retrain_comparison(ablation_results, retrain_ablation_results)
