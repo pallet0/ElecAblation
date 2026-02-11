@@ -1,8 +1,6 @@
 """Complete pipeline for EEG electrode ablation study on SEED-IV."""
 
 import argparse
-import copy
-import itertools
 import json
 from pathlib import Path
 
@@ -10,7 +8,7 @@ import numpy as np
 import scipy.io as sio
 import torch
 import torch.nn as nn
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm  # rebind to tqdm.notebook below if --notebook
 
@@ -96,36 +94,18 @@ def make_channel_mask(active_indices, n_channels=N_CHANNELS, batch_size=1):
 # Training / evaluation helpers
 # ────────────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, optimizer, criterion, device,
-                    mixup_alpha=0.0):
+def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for X_batch, y_batch in loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
-
-        # MixUp augmentation
-        if mixup_alpha > 0:
-            lam = np.random.beta(mixup_alpha, mixup_alpha)
-            idx = torch.randperm(X_batch.size(0), device=device)
-            X_batch = lam * X_batch + (1 - lam) * X_batch[idx]
-            y_a, y_b = y_batch, y_batch[idx]
-
         logits = model(X_batch)
-
-        if mixup_alpha > 0:
-            loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
-        else:
-            loss = criterion(logits, y_batch)
-
+        loss = criterion(logits, y_batch)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item() * y_batch.size(0)
-        if mixup_alpha > 0:
-            correct += (logits.argmax(1) == y_a).sum().item()
-        else:
-            correct += (logits.argmax(1) == y_batch).sum().item()
+        correct += (logits.argmax(1) == y_batch).sum().item()
         total += y_batch.size(0)
     return total_loss / total, correct / total
 
@@ -145,127 +125,81 @@ def evaluate(model, loader, device, channel_mask=None):
     return correct / total
 
 
-# ────────────────────────────────────────────────────────────────────
-# Cross-validation (Phase 1)
-# ────────────────────────────────────────────────────────────────────
-
-def cross_validate(X, y, model_cls, model_kwargs, train_kwargs, k=5, device='cuda',
-                   groups=None):
-    """Group k-fold CV (trial-level splits). Returns (mean_acc, std_acc)."""
-    gkf = GroupKFold(n_splits=k)
-    fold_accs = []
-    fold_bar = tqdm(enumerate(gkf.split(X, y, groups=groups)),
-                    total=k, desc='    Folds', leave=False)
-    for fold, (train_idx, val_idx) in fold_bar:
-        X_tr = torch.tensor(X[train_idx])
-        y_tr = torch.tensor(y[train_idx])
-        X_va = torch.tensor(X[val_idx])
-        y_va = torch.tensor(y[val_idx])
-        tr_loader = DataLoader(TensorDataset(X_tr, y_tr),
-                               batch_size=train_kwargs['batch_size'], shuffle=True)
-        va_loader = DataLoader(TensorDataset(X_va, y_va),
-                               batch_size=512, shuffle=False)
-        model = model_cls(**model_kwargs).to(device)
-        optimizer = torch.optim.Adam(model.parameters(),
-                                     lr=train_kwargs['lr'],
-                                     weight_decay=train_kwargs['wd'])
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=train_kwargs['max_epochs'])
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        best_val_acc = 0.0
-        best_state = None
-        patience_counter = 0
-        mixup_alpha = train_kwargs.get('mixup_alpha', 0.0)
-        for epoch in range(train_kwargs['max_epochs']):
-            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device,
-                                           mixup_alpha=mixup_alpha)
-            val_acc = evaluate(model, va_loader, device)
-            scheduler.step()
-            fold_bar.set_postfix(fold=f'{fold+1}/{k}', epoch=epoch,
-                                 train=f'{train_acc:.4f}', val=f'{val_acc:.4f}',
-                                 best=f'{best_val_acc:.4f}')
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_state = copy.deepcopy(model.state_dict())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= train_kwargs['patience']:
-                    break
-        model.load_state_dict(best_state)
-        fold_accs.append(evaluate(model, va_loader, device))
-    fold_bar.close()
-    return float(np.mean(fold_accs)), float(np.std(fold_accs))
-
+@torch.no_grad()
+def compute_training_auc(model, loader, device):
+    """Compute macro-averaged training AUC (OvR)."""
+    model.eval()
+    all_probs, all_labels = [], []
+    for X_batch, y_batch in loader:
+        X_batch = X_batch.to(device)
+        logits = model(X_batch)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
+        all_probs.append(probs)
+        all_labels.append(y_batch.numpy())
+    y_true = np.concatenate(all_labels)
+    y_prob = np.concatenate(all_probs)
+    return roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro')
 
 
 # ────────────────────────────────────────────────────────────────────
-# Per-subject train & evaluate (Phase 2)
+# LOSO train & evaluate (Phase 2)
 # ────────────────────────────────────────────────────────────────────
 
 def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda'):
-    """Per-subject: train on sessions 1+2, test on session 3 with early stopping.
+    """LOSO: for each subject, train on all other subjects, test on held-out.
 
     Returns: (per_subject_accs dict, trained_models dict)
     """
     results = {}
     models = {}
-    subj_bar = tqdm(range(1, N_SUBJECTS + 1), desc='Subjects')
-    for subj in subj_bar:
-        X_train_full = np.concatenate([data[subj][1][0], data[subj][2][0]])
-        y_train_full = np.concatenate([data[subj][1][1], data[subj][2][1]])
-        # Trial IDs with offset so session 2 trials are unique from session 1
-        groups_full = np.concatenate([data[subj][1][2],
-                                      data[subj][2][2] + 24])
-        X_test, y_test, _ = data[subj][3]
-        # Trial-level train/val split for early stopping (no temporal leakage)
-        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-        tr_idx, va_idx = next(gss.split(X_train_full, y_train_full, groups=groups_full))
-        X_tr, X_va = X_train_full[tr_idx], X_train_full[va_idx]
-        y_tr, y_va = y_train_full[tr_idx], y_train_full[va_idx]
+    subj_bar = tqdm(range(1, N_SUBJECTS + 1), desc='LOSO folds')
+    for test_subj in subj_bar:
+        # Pool ALL sessions from all OTHER subjects
+        X_train = np.concatenate([data[s][sess][0]
+                                  for s in range(1, N_SUBJECTS + 1) if s != test_subj
+                                  for sess in range(1, N_SESSIONS + 1)])
+        y_train = np.concatenate([data[s][sess][1]
+                                  for s in range(1, N_SUBJECTS + 1) if s != test_subj
+                                  for sess in range(1, N_SESSIONS + 1)])
+        # Pool ALL sessions from held-out subject
+        X_test = np.concatenate([data[test_subj][sess][0]
+                                 for sess in range(1, N_SESSIONS + 1)])
+        y_test = np.concatenate([data[test_subj][sess][1]
+                                 for sess in range(1, N_SESSIONS + 1)])
+
         tr_loader = DataLoader(
-            TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr)),
+            TensorDataset(torch.tensor(X_train), torch.tensor(y_train)),
             batch_size=train_kwargs['batch_size'], shuffle=True)
-        va_loader = DataLoader(
-            TensorDataset(torch.tensor(X_va), torch.tensor(y_va)),
-            batch_size=512, shuffle=False)
         te_loader = DataLoader(
             TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
             batch_size=512, shuffle=False)
+
         model = model_cls(**model_kwargs).to(device)
         optimizer = torch.optim.Adam(model.parameters(),
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=train_kwargs['max_epochs'])
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        best_val_acc = 0.0
-        best_state = None
-        patience_counter = 0
-        mixup_alpha = train_kwargs.get('mixup_alpha', 0.0)
+        criterion = nn.CrossEntropyLoss()
+
+        auc_threshold = train_kwargs.get('auc_threshold', 0.99)
+        train_auc = 0.0
         epoch_bar = tqdm(range(train_kwargs['max_epochs']),
-                         desc=f'  S{subj:02d} epochs', leave=False)
+                         desc=f'  S{test_subj:02d} epochs', leave=False)
         for epoch in epoch_bar:
-            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device,
-                                           mixup_alpha=mixup_alpha)
-            val_acc = evaluate(model, va_loader, device)
-            scheduler.step()
-            epoch_bar.set_postfix(train=f'{train_acc:.4f}', val=f'{val_acc:.4f}', best=f'{best_val_acc:.4f}')
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_state = copy.deepcopy(model.state_dict())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= train_kwargs['patience']:
-                    break
+            _, train_acc = train_one_epoch(model, tr_loader, optimizer,
+                                           criterion, device)
+            train_auc = compute_training_auc(model, tr_loader, device)
+            epoch_bar.set_postfix(train=f'{train_acc:.4f}',
+                                  auc=f'{train_auc:.4f}')
+            if train_auc >= auc_threshold:
+                break
         epoch_bar.close()
-        model.load_state_dict(best_state)
+
         test_acc = evaluate(model, te_loader, device)
-        results[subj] = test_acc
-        models[subj] = model
+        results[test_subj] = test_acc
+        models[test_subj] = model
         subj_bar.set_postfix(last_test=f'{test_acc:.4f}')
-        tqdm.write(f"  Subject {subj:2d}: val={best_val_acc:.4f}  test={test_acc:.4f}")
+        tqdm.write(f"  LOSO fold {test_subj:2d}: auc={train_auc:.4f}  "
+                   f"test={test_acc:.4f}")
     accs = list(results.values())
     print(f"  Mean: {np.mean(accs):.4f} +/- {np.std(accs):.4f}")
     return results, models
@@ -367,10 +301,13 @@ def integrated_gradients_importance(model, X, y, device, n_steps=50,
 # ────────────────────────────────────────────────────────────────────
 
 def _eval_all_subjects(models, data, mask, device):
-    """Evaluate all subjects with a given channel mask. Returns list of 15 accuracies."""
+    """Evaluate all LOSO folds with a given channel mask. Returns list of 15 accuracies."""
     accs = []
     for subj in range(1, N_SUBJECTS + 1):
-        X_test, y_test, _ = data[subj][3]
+        X_test = np.concatenate([data[subj][sess][0]
+                                 for sess in range(1, N_SESSIONS + 1)])
+        y_test = np.concatenate([data[subj][sess][1]
+                                 for sess in range(1, N_SESSIONS + 1)])
         loader = DataLoader(
             TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
             batch_size=512, shuffle=False)
@@ -378,59 +315,45 @@ def _eval_all_subjects(models, data, mask, device):
     return accs
 
 
-def _retrain_all_subjects(data, channel_indices, model_kwargs, train_kwargs, device):
-    """Retrain fresh SOGNN using only selected channels. Returns list of 15 accuracies."""
+def _retrain_loso(data, channel_indices, model_kwargs, train_kwargs, device):
+    """LOSO retrain: for each fold, train on 14 subjects' selected channels,
+    test on held-out subject. Returns list of 15 accuracies."""
     n_ch = len(channel_indices)
     ch_idx = list(channel_indices)
     mk = {**model_kwargs, 'n_electrodes': n_ch}
-    mixup_alpha = train_kwargs.get('mixup_alpha', 0.0)
     accs = []
-    for subj in range(1, N_SUBJECTS + 1):
-        X_train_full = np.concatenate([data[subj][1][0][:, ch_idx, :, :],
-                                        data[subj][2][0][:, ch_idx, :, :]])
-        y_train_full = np.concatenate([data[subj][1][1], data[subj][2][1]])
-        groups_full = np.concatenate([data[subj][1][2],
-                                      data[subj][2][2] + 24])
-        X_test = data[subj][3][0][:, ch_idx, :, :]
-        y_test = data[subj][3][1]
-        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-        tr_idx, va_idx = next(gss.split(X_train_full, y_train_full,
-                                         groups=groups_full))
-        X_tr, X_va = X_train_full[tr_idx], X_train_full[va_idx]
-        y_tr, y_va = y_train_full[tr_idx], y_train_full[va_idx]
+    for test_subj in range(1, N_SUBJECTS + 1):
+        X_train = np.concatenate([data[s][sess][0][:, ch_idx, :, :]
+                                  for s in range(1, N_SUBJECTS + 1)
+                                  if s != test_subj
+                                  for sess in range(1, N_SESSIONS + 1)])
+        y_train = np.concatenate([data[s][sess][1]
+                                  for s in range(1, N_SUBJECTS + 1)
+                                  if s != test_subj
+                                  for sess in range(1, N_SESSIONS + 1)])
+        X_test = np.concatenate([data[test_subj][sess][0][:, ch_idx, :, :]
+                                 for sess in range(1, N_SESSIONS + 1)])
+        y_test = np.concatenate([data[test_subj][sess][1]
+                                 for sess in range(1, N_SESSIONS + 1)])
+
         tr_loader = DataLoader(
-            TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr)),
+            TensorDataset(torch.tensor(X_train), torch.tensor(y_train)),
             batch_size=train_kwargs['batch_size'], shuffle=True)
-        va_loader = DataLoader(
-            TensorDataset(torch.tensor(X_va), torch.tensor(y_va)),
-            batch_size=512, shuffle=False)
         te_loader = DataLoader(
             TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
             batch_size=512, shuffle=False)
+
         model = SOGNN(**mk).to(device)
         optimizer = torch.optim.Adam(model.parameters(),
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=train_kwargs['max_epochs'])
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        best_val_acc = 0.0
-        best_state = None
-        patience_counter = 0
+        criterion = nn.CrossEntropyLoss()
+        auc_threshold = train_kwargs.get('auc_threshold', 0.99)
         for epoch in range(train_kwargs['max_epochs']):
-            train_one_epoch(model, tr_loader, optimizer, criterion, device,
-                            mixup_alpha=mixup_alpha)
-            val_acc = evaluate(model, va_loader, device)
-            scheduler.step()
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_state = copy.deepcopy(model.state_dict())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= train_kwargs['patience']:
-                    break
-        model.load_state_dict(best_state)
+            train_one_epoch(model, tr_loader, optimizer, criterion, device)
+            train_auc = compute_training_auc(model, tr_loader, device)
+            if train_auc >= auc_threshold:
+                break
         accs.append(evaluate(model, te_loader, device))
     return accs
 
@@ -546,7 +469,7 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
 
 def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
                                device='cuda'):
-    """Retrain-from-scratch ablation: fresh model per config. Returns dict of results."""
+    """Retrain-from-scratch ablation: fresh LOSO model per config. Returns dict of results."""
     all_results = {}
     all_ch = set(range(N_CHANNELS))
 
@@ -558,8 +481,7 @@ def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
         region_configs.append((f'remove_{region_name}', remaining))
     region_bar = tqdm(region_configs, desc='  Retrain regions')
     for config_name, indices in region_bar:
-        accs = _retrain_all_subjects(data, indices, model_kwargs, train_kwargs,
-                                      device)
+        accs = _retrain_loso(data, indices, model_kwargs, train_kwargs, device)
         all_results[config_name] = {
             'n_channels': len(indices),
             'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
@@ -575,8 +497,7 @@ def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
         lobe_configs.append((f'lobe_remove_{lobe_name}', remaining))
     lobe_bar = tqdm(lobe_configs, desc='  Retrain lobes')
     for config_name, indices in lobe_bar:
-        accs = _retrain_all_subjects(data, indices, model_kwargs, train_kwargs,
-                                      device)
+        accs = _retrain_loso(data, indices, model_kwargs, train_kwargs, device)
         all_results[config_name] = {
             'n_channels': len(indices),
             'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
@@ -587,8 +508,7 @@ def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
     # Hemisphere experiments
     hemi_bar = tqdm(HEMISPHERES.items(), desc='  Retrain hemispheres')
     for hemi_name, indices in hemi_bar:
-        accs = _retrain_all_subjects(data, indices, model_kwargs, train_kwargs,
-                                      device)
+        accs = _retrain_loso(data, indices, model_kwargs, train_kwargs, device)
         all_results[f'hemisphere_{hemi_name}'] = {
             'n_channels': len(indices),
             'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
@@ -605,8 +525,7 @@ def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
     }
     mont_bar = tqdm(montages.items(), desc='  Retrain montages')
     for mont_name, indices in mont_bar:
-        accs = _retrain_all_subjects(data, indices, model_kwargs, train_kwargs,
-                                      device)
+        accs = _retrain_loso(data, indices, model_kwargs, train_kwargs, device)
         all_results[f'montage_{mont_name}'] = {
             'n_channels': len(indices),
             'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
@@ -624,15 +543,14 @@ def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
         step_bar = tqdm(n_keep_steps, desc=f'  Retrain {strategy_name}')
         for n_keep in step_bar:
             keep = ranking[:n_keep].tolist()
-            accs = _retrain_all_subjects(data, keep, model_kwargs, train_kwargs,
-                                          device)
+            accs = _retrain_loso(data, keep, model_kwargs, train_kwargs, device)
             curve[n_keep] = {'mean': float(np.mean(accs)),
                              'std': float(np.std(accs))}
             step_bar.set_postfix(n_keep=n_keep, acc=f'{np.mean(accs):.4f}')
         all_results[f'progressive_{strategy_name}'] = curve
         print(f"  Progressive retrain {strategy_name}: done")
 
-    # Progressive random (5 seeds × 8 levels)
+    # Progressive random (5 seeds x 8 levels)
     curve_random = {}
     rand_bar = tqdm(n_keep_steps, desc='  Retrain random')
     for n_keep in rand_bar:
@@ -640,8 +558,7 @@ def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
         for seed in range(5):
             rng = np.random.RandomState(seed)
             keep = rng.choice(N_CHANNELS, n_keep, replace=False).tolist()
-            accs = _retrain_all_subjects(data, keep, model_kwargs, train_kwargs,
-                                          device)
+            accs = _retrain_loso(data, keep, model_kwargs, train_kwargs, device)
             subj_means += np.array(accs)
         subj_means /= 5
         curve_random[n_keep] = {
@@ -888,8 +805,6 @@ if __name__ == '__main__':
                         help='Path to SEED-IV eeg_feature_smooth directory')
     parser.add_argument('--device', type=str, default=None,
                         help='Device (default: auto-detect)')
-    parser.add_argument('--skip_search', action='store_true',
-                        help='Skip HP search, use defaults')
     parser.add_argument('--notebook', action='store_true',
                         help='Use tqdm.notebook for Colab/Jupyter')
     parser.add_argument('--retrain_ablation', action='store_true',
@@ -928,68 +843,16 @@ if __name__ == '__main__':
         sizes = [data[subj][s][0].shape[0] for s in range(1, N_SESSIONS + 1)]
         print(f"  Subject {subj:2d}: {sizes} samples per session")
 
-    # Pool sessions 1+2 for HP search (trial IDs offset to be globally unique)
-    X_pool = np.concatenate([data[s][sess][0]
-                             for s in range(1, N_SUBJECTS + 1)
-                             for sess in [1, 2]])
-    y_pool = np.concatenate([data[s][sess][1]
-                             for s in range(1, N_SUBJECTS + 1)
-                             for sess in [1, 2]])
-    trial_pool = np.concatenate([data[s][sess][2] + s * 1000 + sess * 100
-                                 for s in range(1, N_SUBJECTS + 1)
-                                 for sess in [1, 2]])
-    print(f"  Pooled shape: {X_pool.shape}, labels: {np.bincount(y_pool)}")
+    # ── Fixed hyperparameters (matching SOGNN paper) ──
+    model_kwargs = {'n_electrodes': N_CHANNELS, 'n_bands': N_BANDS,
+                    'n_timeframes': T_FIXED, 'n_classes': N_CLASSES,
+                    'top_k': 10, 'dropout': 0.1}
+    train_kwargs = {'lr': 1e-5, 'wd': 1e-4, 'batch_size': 16,
+                    'max_epochs': 200, 'auc_threshold': 0.99}
 
-    # ── Phase 1: Hyperparameter search (MLP only) ──
-    if args.skip_search:
-        best_kwargs = {'n_electrodes': N_CHANNELS, 'n_bands': N_BANDS,
-                       'n_timeframes': T_FIXED, 'n_classes': N_CLASSES,
-                       'top_k': 10, 'dropout': 0.1}
-        best_train_kwargs = {'lr': 1e-5, 'wd': 1e-4, 'batch_size': 16,
-                             'max_epochs': 200, 'patience': 15,
-                             'mixup_alpha': 0.0}
-        print("\n=== Phase 1: Skipped (using defaults) ===")
-    else:
-        print("\n=== Phase 1: SOGNN HP search (5-fold CV) ===")
-        sognn_search_space = {
-            'top_k': [5, 10, 15],
-            'dropout': [0.1, 0.3],
-            'lr': [1e-5, 5e-5, 1e-4],
-            'batch_size': [16, 32],
-            'mixup_alpha': [0.0, 0.2],
-        }
-        best_score = 0.0
-        best_kwargs = None
-        best_train_kwargs = None
-        configs = list(itertools.product(
-            sognn_search_space['top_k'],
-            sognn_search_space['dropout'],
-            sognn_search_space['lr'],
-            sognn_search_space['batch_size'],
-            sognn_search_space['mixup_alpha'],
-        ))
-        pbar = tqdm(configs, desc='SOGNN HP search')
-        for top_k, drop, lr, bs, mix_a in pbar:
-            mk = {'n_electrodes': N_CHANNELS, 'n_bands': N_BANDS,
-                   'n_timeframes': T_FIXED, 'n_classes': N_CLASSES,
-                   'top_k': top_k, 'dropout': drop}
-            tk = {'lr': lr, 'wd': 1e-4, 'batch_size': bs,
-                  'max_epochs': 200, 'patience': 15,
-                  'mixup_alpha': mix_a}
-            mean_acc, std_acc = cross_validate(X_pool, y_pool,
-                                               SOGNN, mk, tk,
-                                               device=device, groups=trial_pool)
-            if mean_acc > best_score:
-                best_score = mean_acc
-                best_kwargs = mk
-                best_train_kwargs = tk
-            pbar.set_postfix(best=f'{best_score:.4f}', last=f'{mean_acc:.4f}')
-        print(f"Best SOGNN CV Acc: {best_score:.4f}")
-        print(f"Best SOGNN config: {best_kwargs}, {best_train_kwargs}")
-
-    # ── Phases 2+3+3b: Multi-seed ensemble ──
+    # ── Phases 2+3+3b: Multi-seed ensemble (LOSO) ──
     n_seeds = args.n_seeds
-    print(f"\n=== Multi-seed ensemble: {n_seeds} seed(s) ===")
+    print(f"\n=== Multi-seed ensemble: {n_seeds} seed(s), LOSO ===")
     all_seed_models = []
     all_seed_results = []
     all_seed_importances = []
@@ -1001,19 +864,22 @@ if __name__ == '__main__':
         set_seed(seed)
         print(f"\n--- Seed {seed}/{n_seeds} ---")
 
-        # Phase 2: Per-subject train/test
-        print(f"  Phase 2: Training (seed {seed})")
+        # Phase 2: LOSO train/test
+        print(f"  Phase 2: LOSO training (seed {seed})")
         results_k, models_k = train_and_evaluate(
-            data, SOGNN, best_kwargs, best_train_kwargs, device)
+            data, SOGNN, model_kwargs, train_kwargs, device)
         all_seed_results.append(results_k)
         all_seed_models.append(models_k)
 
-        # Phase 3: Permutation importance
+        # Phase 3: Permutation importance (on held-out subject's ALL sessions)
         print(f"  Phase 3: Permutation importance (seed {seed})")
         imp_k = np.zeros((N_SUBJECTS, N_CHANNELS))
         pi_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'PI seed {seed}')
         for subj in pi_bar:
-            X_test, y_test, _ = data[subj][3]
+            X_test = np.concatenate([data[subj][sess][0]
+                                     for sess in range(1, N_SESSIONS + 1)])
+            y_test = np.concatenate([data[subj][sess][1]
+                                     for sess in range(1, N_SESSIONS + 1)])
             imp_k[subj - 1] = permutation_importance(
                 models_k[subj], X_test, y_test, device, n_repeats=10)
         all_seed_importances.append(imp_k)
@@ -1023,7 +889,10 @@ if __name__ == '__main__':
         ig_k = np.zeros((N_SUBJECTS, N_CHANNELS))
         ig_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'IG seed {seed}')
         for subj in ig_bar:
-            X_test, y_test, _ = data[subj][3]
+            X_test = np.concatenate([data[subj][sess][0]
+                                     for sess in range(1, N_SESSIONS + 1)])
+            y_test = np.concatenate([data[subj][sess][1]
+                                     for sess in range(1, N_SESSIONS + 1)])
             ig_k[subj - 1] = integrated_gradients_importance(
                 models_k[subj], X_test, y_test, device, n_steps=50)
         all_seed_ig_importances.append(ig_k)
@@ -1032,7 +901,10 @@ if __name__ == '__main__':
         emo_k = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
         emo_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'Emo-PI seed {seed}')
         for subj in emo_bar:
-            X_test, y_test, _ = data[subj][3]
+            X_test = np.concatenate([data[subj][sess][0]
+                                     for sess in range(1, N_SESSIONS + 1)])
+            y_test = np.concatenate([data[subj][sess][1]
+                                     for sess in range(1, N_SESSIONS + 1)])
             subj_emo = per_emotion_permutation_importance(
                 models_k[subj], X_test, y_test, device, n_repeats=10)
             for c in subj_emo:
@@ -1145,10 +1017,9 @@ if __name__ == '__main__':
     # ── Phase 4b: Retrain-from-scratch ablation (optional) ──
     retrain_ablation_results = None
     if args.retrain_ablation:
-        print("\n=== Phase 4b: Retrain-from-scratch ablation ===")
+        print("\n=== Phase 4b: Retrain-from-scratch ablation (LOSO) ===")
         retrain_ablation_results = run_retrain_ablation_study(
-            data, grand_ranking, best_kwargs, best_train_kwargs,
-            device)
+            data, grand_ranking, model_kwargs, train_kwargs, device)
 
     # ── Phase 5: Visualization & statistics ──
     print("\n=== Phase 5: Visualization ===")
@@ -1201,6 +1072,7 @@ if __name__ == '__main__':
     # Save all results
     save_results = {
         'n_seeds': n_seeds,
+        'evaluation': 'LOSO',
         'sognn_per_subject': {str(k): v for k, v in sognn_results.items()},
         'sognn_mean': float(np.mean(list(sognn_results.values()))),
         'grand_ranking': grand_ranking.tolist(),
@@ -1210,8 +1082,8 @@ if __name__ == '__main__':
         'grand_ig_ranking': grand_ig_ranking.tolist(),
         'ig_importance_std': ig_importance_std.tolist(),
         'ablation': ablation_results,
-        'best_sognn_kwargs': best_kwargs,
-        'best_sognn_train_kwargs': best_train_kwargs,
+        'model_kwargs': model_kwargs,
+        'train_kwargs': train_kwargs,
     }
     if retrain_ablation_results is not None:
         save_results['ablation_retrain'] = retrain_ablation_results

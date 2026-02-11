@@ -30,7 +30,8 @@
       "mcp__plugin_serena_serena__execute_shell_command",
       "mcp__plugin_serena_serena__read_memory",
       "mcp__plugin_serena_serena__write_memory",
-      "mcp__plugin_serena_serena__list_memories"
+      "mcp__plugin_serena_serena__list_memories",
+      "WebFetch(domain:public-pages-files-2025.frontiersin.org)"
     ]
   }
 }
