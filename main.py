@@ -17,9 +17,9 @@ from tqdm.auto import tqdm  # rebind to tqdm.notebook below if --notebook
 from config import (
     CHANNEL_NAMES, DATA_ROOT, EMOTIV_EPOC, HEMISPHERES, LOBES, MNE_NAME_MAP,
     MUSE_APPROX, N_BANDS, N_CHANNELS, N_CLASSES, N_SESSIONS, N_SUBJECTS,
-    REGIONS_FINE, SESSION_LABELS, STANDARD_1020,
+    REGIONS_FINE, SESSION_LABELS, STANDARD_1020, T_FIXED,
 )
-from models import MLPBaseline
+from models import SOGNN
 
 
 def set_seed(seed):
@@ -37,27 +37,47 @@ def set_seed(seed):
 def load_seed4_session(mat_path, session_idx):
     """Load one session's DE features from a SEED-IV .mat file.
 
+    Each trial is one sample, zero-padded to T_FIXED and z-score normalized
+    (statistics computed from all frames before padding).
+
     Args:
         mat_path: path to the .mat file
         session_idx: 0-based session index (for label lookup)
-    Returns: X (n_samples, 62, 5), y (n_samples,), trial_ids (n_samples,)
+    Returns: X (24, 62, 5, T_FIXED), y (24,), trial_ids (24,)
     """
     data = sio.loadmat(mat_path)
     labels = SESSION_LABELS[session_idx]
-    X_list, y_list, trial_id_list = [], [], []
+    trials_raw = []  # list of (T_k, 62, 5) arrays
+    y_list = []
     for trial_idx in range(24):
         key = f'de_LDS{trial_idx + 1}'
         if key not in data:
             continue
-        trial_data = data[key]                       # (62, T, 5)
-        trial_data = trial_data.transpose(1, 0, 2)  # -> (T, 62, 5)
-        n_t = trial_data.shape[0]
-        X_list.append(trial_data)
-        y_list.append(np.full(n_t, labels[trial_idx]))
-        trial_id_list.append(np.full(n_t, trial_idx))
-    X = np.concatenate(X_list, axis=0).astype(np.float32)
-    y = np.concatenate(y_list, axis=0).astype(np.int64)
-    trial_ids = np.concatenate(trial_id_list, axis=0).astype(np.int64)
+        trial_data = data[key]                       # (62, T_k, 5)
+        trial_data = trial_data.transpose(1, 0, 2)  # -> (T_k, 62, 5)
+        trials_raw.append(trial_data)
+        y_list.append(labels[trial_idx])
+    # Compute z-score statistics from ALL frames before padding
+    all_frames = np.concatenate(trials_raw, axis=0)  # (N_total, 62, 5)
+    mean = all_frames.mean(axis=0, keepdims=True)    # (1, 62, 5)
+    std = all_frames.std(axis=0, keepdims=True) + 1e-8
+    # Normalize each trial, zero-pad, and transpose to (62, 5, T_FIXED)
+    X_list = []
+    for trial in trials_raw:
+        trial_normed = (trial - mean) / std           # (T_k, 62, 5)
+        T_k = trial_normed.shape[0]
+        if T_k < T_FIXED:
+            pad_width = ((0, T_FIXED - T_k), (0, 0), (0, 0))
+            trial_padded = np.pad(trial_normed, pad_width, mode='constant')
+        elif T_k > T_FIXED:
+            trial_padded = trial_normed[:T_FIXED]
+        else:
+            trial_padded = trial_normed
+        # (T_FIXED, 62, 5) -> (62, 5, T_FIXED)
+        X_list.append(trial_padded.transpose(1, 2, 0))
+    X = np.stack(X_list, axis=0).astype(np.float32)  # (24, 62, 5, T_FIXED)
+    y = np.array(y_list, dtype=np.int64)
+    trial_ids = np.arange(len(y_list), dtype=np.int64)
     return X, y, trial_ids
 
 
@@ -91,7 +111,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
             X_batch = lam * X_batch + (1 - lam) * X_batch[idx]
             y_a, y_b = y_batch, y_batch[idx]
 
-        logits = model(X_batch.view(X_batch.size(0), -1))
+        logits = model(X_batch)
 
         if mixup_alpha > 0:
             loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
@@ -117,9 +137,9 @@ def evaluate(model, loader, device, channel_mask=None):
     for X_batch, y_batch in loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
         if channel_mask is not None:
-            mask = channel_mask.to(device).unsqueeze(-1)  # (1,C,1)
+            mask = channel_mask.to(device).unsqueeze(-1).unsqueeze(-1)  # (1,C,1,1)
             X_batch = X_batch * mask
-        logits = model(X_batch.view(X_batch.size(0), -1))
+        logits = model(X_batch)
         correct += (logits.argmax(1) == y_batch).sum().item()
         total += y_batch.size(0)
     return correct / total
@@ -260,8 +280,8 @@ def permutation_importance(model, X, y, device, n_repeats=10):
     """Compute permutation importance for each of 62 channels.
 
     Args:
-        model: trained MLPBaseline
-        X: numpy array (N, 62, 5)
+        model: trained SOGNN
+        X: numpy array (N, 62, 5, T_FIXED)
         y: numpy array (N,)
         device: torch device
         n_repeats: number of shuffle repeats per channel
@@ -272,7 +292,7 @@ def permutation_importance(model, X, y, device, n_repeats=10):
     y_t = torch.tensor(y, dtype=torch.long, device=device)
     N = X_t.size(0)
     # Baseline accuracy
-    logits = model(X_t.reshape(N, -1))
+    logits = model(X_t)
     baseline_acc = (logits.argmax(1) == y_t).float().mean().item()
     n_channels = X.shape[1]
     importances = np.zeros(n_channels)
@@ -281,8 +301,8 @@ def permutation_importance(model, X, y, device, n_repeats=10):
         for _ in range(n_repeats):
             X_perm = X_t.clone()
             perm_idx = torch.randperm(N, device=device)
-            X_perm[:, ch, :] = X_perm[perm_idx, ch, :]
-            logits = model(X_perm.reshape(N, -1))
+            X_perm[:, ch, :, :] = X_perm[perm_idx, ch, :, :]
+            logits = model(X_perm)
             acc = (logits.argmax(1) == y_t).float().mean().item()
             shuffled_accs.append(acc)
         importances[ch] = baseline_acc - float(np.mean(shuffled_accs))
@@ -304,44 +324,41 @@ def per_emotion_permutation_importance(model, X, y, device,
 
 
 def integrated_gradients_importance(model, X, y, device, n_steps=50,
-                                    batch_size=256):
+                                    batch_size=24):
     """Compute Integrated Gradients channel importance.
 
     Args:
-        model: trained MLPBaseline
-        X: numpy array (N, 62, 5)
+        model: trained SOGNN
+        X: numpy array (N, 62, 5, T_FIXED)
         y: numpy array (N,)
         device: torch device
         n_steps: interpolation steps (default 50)
-        batch_size: batch size for forward/backward passes
+        batch_size: batch size for forward/backward passes (default 24)
     Returns: (62,) array — per-channel importance (positive = important)
     """
     model.eval()
-    X_t = torch.tensor(X, dtype=torch.float32, device=device)  # (N, 62, 5)
+    X_t = torch.tensor(X, dtype=torch.float32, device=device)  # (N, 62, 5, T)
     y_t = torch.tensor(y, dtype=torch.long, device=device)
-    N, C, B = X_t.shape  # N samples, 62 channels, 5 bands
-    flat_dim = C * B  # 310
+    N = X_t.shape[0]
 
-    accum = torch.zeros(N, flat_dim, device=device)
+    accum = torch.zeros_like(X_t)  # (N, 62, 5, T)
 
     for step in range(1, n_steps + 1):
         alpha = step / n_steps
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
-            x_interp = (alpha * X_t[start:end]).reshape(end - start, flat_dim)
-            x_interp.requires_grad_(True)
+            x_interp = (alpha * X_t[start:end]).detach().requires_grad_(True)
             logits = model(x_interp)
             target_logits = logits.gather(1, y_t[start:end].unsqueeze(1)).squeeze(1)
             target_logits.sum().backward()
             accum[start:end] += x_interp.grad.detach()
 
     # IG = (input - baseline) * avg_grad; baseline=0 → input * avg_grad
-    avg_grad = accum / n_steps  # (N, 310)
-    ig = X_t.reshape(N, flat_dim) * avg_grad  # (N, 310)
+    avg_grad = accum / n_steps       # (N, 62, 5, T)
+    ig = X_t * avg_grad              # (N, 62, 5, T)
 
-    # Per-channel: reshape to (N, 62, 5), sum |IG| over bands, mean over samples
-    ig = ig.reshape(N, C, B)
-    channel_importance = ig.abs().sum(dim=2).mean(dim=0)  # (62,)
+    # Per-channel: sum |IG| over bands and time, mean over samples
+    channel_importance = ig.abs().sum(dim=(2, 3)).mean(dim=0)  # (62,)
     return channel_importance.cpu().numpy()
 
 
@@ -362,19 +379,19 @@ def _eval_all_subjects(models, data, mask, device):
 
 
 def _retrain_all_subjects(data, channel_indices, model_kwargs, train_kwargs, device):
-    """Retrain fresh MLPBaseline using only selected channels. Returns list of 15 accuracies."""
+    """Retrain fresh SOGNN using only selected channels. Returns list of 15 accuracies."""
     n_ch = len(channel_indices)
     ch_idx = list(channel_indices)
-    mk = {**model_kwargs, 'input_dim': n_ch * N_BANDS}
+    mk = {**model_kwargs, 'n_electrodes': n_ch}
     mixup_alpha = train_kwargs.get('mixup_alpha', 0.0)
     accs = []
     for subj in range(1, N_SUBJECTS + 1):
-        X_train_full = np.concatenate([data[subj][1][0][:, ch_idx, :],
-                                        data[subj][2][0][:, ch_idx, :]])
+        X_train_full = np.concatenate([data[subj][1][0][:, ch_idx, :, :],
+                                        data[subj][2][0][:, ch_idx, :, :]])
         y_train_full = np.concatenate([data[subj][1][1], data[subj][2][1]])
         groups_full = np.concatenate([data[subj][1][2],
                                       data[subj][2][2] + 24])
-        X_test = data[subj][3][0][:, ch_idx, :]
+        X_test = data[subj][3][0][:, ch_idx, :, :]
         y_test = data[subj][3][1]
         gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
         tr_idx, va_idx = next(gss.split(X_train_full, y_train_full,
@@ -390,7 +407,7 @@ def _retrain_all_subjects(data, channel_indices, model_kwargs, train_kwargs, dev
         te_loader = DataLoader(
             TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
             batch_size=512, shuffle=False)
-        model = MLPBaseline(**mk).to(device)
+        model = SOGNN(**mk).to(device)
         optimizer = torch.optim.Adam(model.parameters(),
                                      lr=train_kwargs['lr'],
                                      weight_decay=train_kwargs['wd'])
@@ -502,7 +519,8 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
             keep = ranking[:n_keep].tolist()
             mask = make_channel_mask(keep, batch_size=1).to(device)
             accs = _eval_all_subjects(models, data, mask, device)
-            curve[n_keep] = {'mean': float(np.mean(accs)), 'std': float(np.std(accs))}
+            curve[n_keep] = {'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
+                            'per_subj': accs}
         all_results[f'progressive_{strategy_name}'] = curve
         print(f"  Progressive {strategy_name}: done")
 
@@ -518,6 +536,7 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
         subj_means /= 20
         curve_random[n_keep] = {
             'mean': float(np.mean(subj_means)), 'std': float(np.std(subj_means)),
+            'per_subj': subj_means.tolist(),
         }
     all_results['progressive_random'] = curve_random
     print("  Progressive random: done")
@@ -904,9 +923,6 @@ if __name__ == '__main__':
             if subj not in data:
                 data[subj] = {}
             X, y, trial_ids = load_seed4_session(str(mat_path), session_idx=sess - 1)
-            mean = X.mean(axis=0, keepdims=True)
-            std = X.std(axis=0, keepdims=True) + 1e-8
-            X = (X - mean) / std
             data[subj][sess] = (X, y, trial_ids)
     for subj in range(1, N_SUBJECTS + 1):
         sizes = [data[subj][s][0].shape[0] for s in range(1, N_SESSIONS + 1)]
@@ -926,46 +942,50 @@ if __name__ == '__main__':
 
     # ── Phase 1: Hyperparameter search (MLP only) ──
     if args.skip_search:
-        best_mlp_kwargs = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
-                           'h1': 128, 'h2': 64, 'dropout': 0.5}
-        best_mlp_train_kwargs = {'lr': 5e-4, 'wd': 1e-4, 'batch_size': 128,
-                                 'max_epochs': 200, 'patience': 10,
-                                 'mixup_alpha': 0.0}
+        best_kwargs = {'n_electrodes': N_CHANNELS, 'n_bands': N_BANDS,
+                       'n_timeframes': T_FIXED, 'n_classes': N_CLASSES,
+                       'top_k': 10, 'dropout': 0.1}
+        best_train_kwargs = {'lr': 1e-5, 'wd': 1e-4, 'batch_size': 16,
+                             'max_epochs': 200, 'patience': 15,
+                             'mixup_alpha': 0.0}
         print("\n=== Phase 1: Skipped (using defaults) ===")
     else:
-        print("\n=== Phase 1: MLP HP search (5-fold CV) ===")
-        mlp_search_space = {
-            'h1': [128, 256], 'h2': [64],
-            'dropout': [0.3, 0.5], 'lr': [5e-4],
-            'wd': [1e-4], 'batch_size': [128],
+        print("\n=== Phase 1: SOGNN HP search (5-fold CV) ===")
+        sognn_search_space = {
+            'top_k': [5, 10, 15],
+            'dropout': [0.1, 0.3],
+            'lr': [1e-5, 5e-5, 1e-4],
+            'batch_size': [16, 32],
             'mixup_alpha': [0.0, 0.2],
         }
-        best_mlp_score = 0.0
-        best_mlp_kwargs = None
-        best_mlp_train_kwargs = None
+        best_score = 0.0
+        best_kwargs = None
+        best_train_kwargs = None
         configs = list(itertools.product(
-            mlp_search_space['h1'], mlp_search_space['h2'],
-            mlp_search_space['dropout'], mlp_search_space['lr'],
-            mlp_search_space['wd'], mlp_search_space['batch_size'],
-            mlp_search_space['mixup_alpha'],
+            sognn_search_space['top_k'],
+            sognn_search_space['dropout'],
+            sognn_search_space['lr'],
+            sognn_search_space['batch_size'],
+            sognn_search_space['mixup_alpha'],
         ))
-        pbar = tqdm(configs, desc='MLP HP search')
-        for h1, h2, drop, lr, wd, bs, mix_a in pbar:
-            mk = {'input_dim': N_CHANNELS * N_BANDS, 'n_classes': N_CLASSES,
-                   'h1': h1, 'h2': h2, 'dropout': drop}
-            tk = {'lr': lr, 'wd': wd, 'batch_size': bs,
-                  'max_epochs': 200, 'patience': 10,
+        pbar = tqdm(configs, desc='SOGNN HP search')
+        for top_k, drop, lr, bs, mix_a in pbar:
+            mk = {'n_electrodes': N_CHANNELS, 'n_bands': N_BANDS,
+                   'n_timeframes': T_FIXED, 'n_classes': N_CLASSES,
+                   'top_k': top_k, 'dropout': drop}
+            tk = {'lr': lr, 'wd': 1e-4, 'batch_size': bs,
+                  'max_epochs': 200, 'patience': 15,
                   'mixup_alpha': mix_a}
             mean_acc, std_acc = cross_validate(X_pool, y_pool,
-                                               MLPBaseline, mk, tk,
+                                               SOGNN, mk, tk,
                                                device=device, groups=trial_pool)
-            if mean_acc > best_mlp_score:
-                best_mlp_score = mean_acc
-                best_mlp_kwargs = mk
-                best_mlp_train_kwargs = tk
-            pbar.set_postfix(best=f'{best_mlp_score:.4f}', last=f'{mean_acc:.4f}')
-        print(f"Best MLP CV Acc: {best_mlp_score:.4f}")
-        print(f"Best MLP config: {best_mlp_kwargs}, {best_mlp_train_kwargs}")
+            if mean_acc > best_score:
+                best_score = mean_acc
+                best_kwargs = mk
+                best_train_kwargs = tk
+            pbar.set_postfix(best=f'{best_score:.4f}', last=f'{mean_acc:.4f}')
+        print(f"Best SOGNN CV Acc: {best_score:.4f}")
+        print(f"Best SOGNN config: {best_kwargs}, {best_train_kwargs}")
 
     # ── Phases 2+3+3b: Multi-seed ensemble ──
     n_seeds = args.n_seeds
@@ -984,7 +1004,7 @@ if __name__ == '__main__':
         # Phase 2: Per-subject train/test
         print(f"  Phase 2: Training (seed {seed})")
         results_k, models_k = train_and_evaluate(
-            data, MLPBaseline, best_mlp_kwargs, best_mlp_train_kwargs, device)
+            data, SOGNN, best_kwargs, best_train_kwargs, device)
         all_seed_results.append(results_k)
         all_seed_models.append(models_k)
 
@@ -1049,11 +1069,11 @@ if __name__ == '__main__':
           [CHANNEL_NAMES[i] for i in grand_ig_ranking[:10]])
 
     # Test accuracy: per-subject average across seeds
-    mlp_results = {}
+    sognn_results = {}
     for subj in range(1, N_SUBJECTS + 1):
-        mlp_results[subj] = float(np.mean(
+        sognn_results[subj] = float(np.mean(
             [sr[subj] for sr in all_seed_results]))
-    accs = list(mlp_results.values())
+    accs = list(sognn_results.values())
     print(f"  Ensemble mean accuracy: {np.mean(accs):.4f} "
           f"+/- {np.std(accs):.4f}")
 
@@ -1103,11 +1123,12 @@ if __name__ == '__main__':
             curve = {}
             step_keys = list(first_abl[key].keys())
             for nk in step_keys:
-                means_k = [abl[key][nk]['mean'] for abl in all_seed_ablations]
-                stds_k = [abl[key][nk]['std'] for abl in all_seed_ablations]
+                per_subj_stacked = np.array(
+                    [abl[key][nk]['per_subj'] for abl in all_seed_ablations])
+                avg_per_subj = per_subj_stacked.mean(axis=0).tolist()
                 curve[nk] = {
-                    'mean': float(np.mean(means_k)),
-                    'std': float(np.mean(stds_k)),
+                    'mean': float(np.mean(avg_per_subj)),
+                    'std': float(np.std(avg_per_subj)),
                 }
             ablation_results[key] = curve
         else:
@@ -1126,7 +1147,7 @@ if __name__ == '__main__':
     if args.retrain_ablation:
         print("\n=== Phase 4b: Retrain-from-scratch ablation ===")
         retrain_ablation_results = run_retrain_ablation_study(
-            data, grand_ranking, best_mlp_kwargs, best_mlp_train_kwargs,
+            data, grand_ranking, best_kwargs, best_train_kwargs,
             device)
 
     # ── Phase 5: Visualization & statistics ──
@@ -1180,8 +1201,8 @@ if __name__ == '__main__':
     # Save all results
     save_results = {
         'n_seeds': n_seeds,
-        'mlp_per_subject': {str(k): v for k, v in mlp_results.items()},
-        'mlp_mean': float(np.mean(list(mlp_results.values()))),
+        'sognn_per_subject': {str(k): v for k, v in sognn_results.items()},
+        'sognn_mean': float(np.mean(list(sognn_results.values()))),
         'grand_ranking': grand_ranking.tolist(),
         'grand_importance': grand_importance.tolist(),
         'importance_std': importance_std.tolist(),
@@ -1189,8 +1210,8 @@ if __name__ == '__main__':
         'grand_ig_ranking': grand_ig_ranking.tolist(),
         'ig_importance_std': ig_importance_std.tolist(),
         'ablation': ablation_results,
-        'best_mlp_kwargs': best_mlp_kwargs,
-        'best_mlp_train_kwargs': best_mlp_train_kwargs,
+        'best_sognn_kwargs': best_kwargs,
+        'best_sognn_train_kwargs': best_train_kwargs,
     }
     if retrain_ablation_results is not None:
         save_results['ablation_retrain'] = retrain_ablation_results

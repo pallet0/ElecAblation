@@ -144,3 +144,111 @@ class DualAttentionEEGNet(nn.Module):
         context = torch.einsum('bc,bcd->bd', alpha, h_chan)
         logits = self.classifier(context)
         return logits, alpha, beta
+
+
+class SOGNN(nn.Module):
+    """Self-Organized Graph Neural Network for EEG emotion classification.
+
+    Architecture (Li et al., 2021):
+      1. Per-electrode conv-pool chain: (B, E, 5, T) -> (B, E, 512) node features
+      2. Three self-organized graph convolution (SOGC) layers: 512->64->64->64
+      3. Flatten + FC: (B, E*64) -> (B, n_classes)
+
+    Args:
+        n_electrodes: number of EEG electrodes (62 default, variable for retrain ablation)
+        n_bands: number of frequency bands (5 for DE features)
+        n_timeframes: temporal padding length (64 default)
+        n_classes: number of output classes (4 for SEED-IV)
+        top_k: number of neighbors to keep in sparse adjacency
+        dropout: dropout rate for conv blocks and FC layer
+        **kwargs: absorbs extra keys from HP search dicts
+    """
+
+    def __init__(self, n_electrodes=62, n_bands=5, n_timeframes=64,
+                 n_classes=4, top_k=10, dropout=0.1, **kwargs):
+        super().__init__()
+        self.n_electrodes = n_electrodes
+        self.top_k = min(top_k, n_electrodes)
+
+        # ── Per-electrode conv-pool chain ──
+        # Input per electrode: (1, 5, T) -> after 3 blocks -> (128, 1, T')
+        self.conv_pool = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(5, 5), padding=0),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.MaxPool2d(kernel_size=(1, 2)),
+
+            nn.Conv2d(32, 64, kernel_size=(1, 5), padding=0),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.MaxPool2d(kernel_size=(1, 2)),
+
+            nn.Conv2d(64, 128, kernel_size=(1, 5), padding=0),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.MaxPool2d(kernel_size=(1, 2)),
+        )
+
+        # Compute conv-pool output dim dynamically
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, n_bands, n_timeframes)
+            conv_out = self.conv_pool(dummy)
+            self._node_feat_dim = conv_out.numel()  # 128 * 1 * 4 = 512 for (5, 64)
+
+        # ── SOGC layers (3 sequential) ──
+        d_bn = 32  # bottleneck dim for adjacency computation
+        # Layer 1: 512 -> 64
+        self.W_bn1 = nn.Linear(self._node_feat_dim, d_bn, bias=False)
+        self.gc1 = nn.Linear(self._node_feat_dim, 64)
+        # Layer 2: 64 -> 64
+        self.W_bn2 = nn.Linear(64, d_bn, bias=False)
+        self.gc2 = nn.Linear(64, 64)
+        # Layer 3: 64 -> 64
+        self.W_bn3 = nn.Linear(64, d_bn, bias=False)
+        self.gc3 = nn.Linear(64, 64)
+
+        # ── Flatten + FC ──
+        self._graph_out_dim = 64
+        self.classifier = nn.Linear(n_electrodes * self._graph_out_dim, n_classes)
+
+    def _sogc(self, H, W_bn, gc_layer):
+        """One self-organized graph convolution step.
+
+        Args:
+            H: node features (B, E, D_in)
+            W_bn: bottleneck linear layer (D_in -> d_bn)
+            gc_layer: graph conv linear layer (D_in -> D_out)
+        Returns:
+            H_out: (B, E, D_out)
+        """
+        G = torch.tanh(W_bn(H))                                # (B, E, d_bn)
+        A = torch.softmax(G @ G.transpose(-1, -2), dim=-1)     # (B, E, E)
+        # Top-k sparsification (no re-normalization)
+        vals, idxs = A.topk(self.top_k, dim=-1)                # (B, E, k)
+        A_sparse = torch.zeros_like(A).scatter_(-1, idxs, vals) # (B, E, E)
+        H_out = torch.relu(gc_layer(A_sparse @ H))             # (B, E, D_out)
+        return H_out
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, n_electrodes, n_bands, n_timeframes)
+        Returns:
+            logits: (B, n_classes)
+        """
+        B, E = x.shape[0], x.shape[1]
+
+        # Per-electrode conv-pool: reshape to (B*E, 1, bands, T)
+        x = x.reshape(B * E, 1, x.shape[2], x.shape[3])
+        x = self.conv_pool(x)                        # (B*E, 128, 1, T')
+        x = x.reshape(B, E, -1)                      # (B, E, 512) node features
+
+        # 3 SOGC layers
+        x = self._sogc(x, self.W_bn1, self.gc1)      # (B, E, 64)
+        x = self._sogc(x, self.W_bn2, self.gc2)      # (B, E, 64)
+        x = self._sogc(x, self.W_bn3, self.gc3)      # (B, E, 64)
+
+        # Flatten + classify
+        x = x.reshape(B, -1)                          # (B, E * 64)
+        logits = self.classifier(x)                   # (B, n_classes)
+        return logits

@@ -16,6 +16,7 @@ N_BANDS = 5      # delta, theta, alpha, beta, gamma
 N_CLASSES = 4    # 0=neutral, 1=sad, 2=fear, 3=happy
 N_SUBJECTS = 15
 N_SESSIONS = 3
+T_FIXED = 64     # temporal padding length (SOGNN paper SEED-IV setting)
 
 DATA_ROOT = r'C:\Users\palle\Desktop\QIProject\ResStab_SEED-IV\SEED_IV\eeg_feature_smooth'
 

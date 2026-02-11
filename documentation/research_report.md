@@ -1,51 +1,66 @@
 # Research Report: EEG Electrode Ablation Study for Emotion Recognition
 
-## 1. Objective
-The goal of this study is to identify the most critical EEG electrodes and brain regions for emotion recognition. By using an **Attention-Based Neural Network**, we aim to autonomously rank electrode importance and determine the minimum number of sensors required to maintain high classification accuracy. This has direct implications for the development of wearable Brain-Computer Interfaces (BCI).
+## 1. Objective and Motivation
+The primary objective of this study is to perform a rigorous neurophysiological and computational analysis of the SEED-IV dataset to identify the most critical EEG electrodes and brain regions for multi-class emotion recognition. 
 
-## 2. Dataset and Features
-*   **Dataset:** SEED-IV (SJTU Emotion EEG Dataset).
-    *   **Subjects:** 15 individuals.
-    *   **Sessions:** 3 sessions per subject, recorded on different days.
-    *   **Emotions:** 4 classes (Neutral, Sad, Fear, Happy).
-    *   **Stimuli:** 24 movie clips per session.
-*   **Features:** Differential Entropy (DE) features extracted from 62 EEG channels across 5 frequency bands (Delta, Theta, Alpha, Beta, Gamma).
-*   **Preprocessing:** Data is z-score normalized per session to handle inter-session and inter-subject variability.
+While research-grade EEG caps utilize 62 or more channels, such setups are impractical for real-world applications. This study addresses the "Curse of Dimensionality" in EEG data—where the high number of features often leads to overfitting—by identifying a minimal, optimal subset of sensors. By using a model-agnostic interpretability framework, we aim to:
+1.  **Map the Emotional Brain:** Autonomously identify "hot spots" for emotion processing (Neutral, Sad, Fear, Happy).
+2.  **Validate Interpretability:** Prove that statistical importance (Permutation Importance/Integrated Gradients) aligns with functional brain anatomy.
+3.  **Optimize BCI Hardware:** Determine the performance trade-offs for commercial montages (10-20 system, Emotiv EPOC, Muse) to guide the design of next-generation wearable Brain-Computer Interfaces.
 
-## 3. Experimental Architecture: MLPBaseline
-The study employs a standard Multi-Layer Perceptron (MLP) as a robust baseline for emotion classification. This approach allows for model-agnostic feature importance analysis.
-1.  **Input:** Flattened vector of 310 features (62 channels × 5 bands).
-2.  **Hidden Layers:** Two fully connected layers with BatchNorm, ReLU activation, and Dropout.
-3.  **Classifier:** A final linear layer to predict the 4 emotion classes.
+## 2. Dataset and Feature Engineering
+*   **SEED-IV Dataset:** A benchmark dataset from Shanghai Jiao Tong University.
+    *   **Subjects:** 15 healthy subjects (balanced for gender).
+    *   **Sessions:** 3 separate sessions per subject, recorded on different days to ensure cross-day variability.
+    *   **Stimuli:** 24 movie clips (6 clips per emotion: Neutral, Sad, Fear, Happy) per session.
+*   **Differential Entropy (DE) Features:**
+    *   Unlike raw PSD, DE has been shown to be more stable and discriminative for emotion recognition.
+    *   **Frequency Bands:** Delta (1-4Hz), Theta (4-8Hz), Alpha (8-13Hz), Beta (13-30Hz), and Gamma (30-70Hz).
+    *   **Input Dimension:** Each trial is treated as one sample with shape `(62, 5, T)` — 62 channels × 5 bands × T time frames, zero-padded to T=64.
+*   **Preprocessing:**
+    *   **Z-Score Normalization:** Performed per session on all frames *before* zero-padding (`X = (X - μ) / σ`). This mitigates EEG non-stationarity and ensures the zero-padded region represents true zero (≈ session mean).
+
+## 3. Experimental Architecture: SOGNN
+We employ a **Self-Organized Graph Neural Network** (SOGNN; Li et al., 2021), which learns dynamic inter-electrode relationships via self-organized graph convolution. Unlike flat MLP classifiers, SOGNN's graph structure captures spatial dependencies between electrodes — making it well suited for studying which electrodes (graph nodes) drive classification.
+
+*   **Per-electrode feature extraction:** 3 Conv2d+MaxPool blocks process each electrode's `(5, T)` DE features independently, producing a 512-dim node feature vector.
+*   **Self-organized graph convolution (×3 layers):** A dynamic adjacency matrix is computed per sample via `A = softmax(tanh(HW) · tanh(HW)^T)`, sparsified to top-k neighbors. Graph convolution: `H' = ReLU(A_sparse · H · W_gc)`. Output: 64-dim per node.
+*   **Classification:** Node features are flattened (preserving electrode identity) and passed through a linear layer to 4 classes. Total: ~130K parameters.
+*   **Regularization:** Dropout (0.1), weight decay (1e-4), label smoothing (0.1), CosineAnnealingLR, gradient clipping (max_norm=1.0), early stopping on validation accuracy.
+
+**Note on interpretability methods.** Permutation Importance (PI) remains fully model-agnostic — it treats SOGNN as a black box. Integrated Gradients (IG) computes attributions through SOGNN's graph operations. The retrain-from-scratch ablation validates mask-based results by truly removing electrodes from the graph.
+
+**Deviations from the original SOGNN paper.** We use within-subject evaluation (train sessions 1+2, test session 3) rather than cross-subject LOSO, early stopping on validation accuracy rather than a training AUC threshold, and add label smoothing and cosine LR scheduling as regularization for the small per-subject sample size (48 train / 24 test).
 
 ## 4. Experimental Pipeline
 
-### Phase 1: Training Strategy
-*   **Hyperparameter Search:** 5-fold Stratified Cross-Validation on pooled data from Sessions 1 and 2 to find optimal dropout and learning rates.
-*   **Multi-Seed Ensemble:** Each subject is trained across multiple random seeds to ensure the results are statistically stable and robust against initialization noise.
-*   **Per-Subject Training:** Each subject gets a personalized model.
-    *   **Training Set:** Sessions 1 & 2.
-    *   **Test Set:** Session 3 (to evaluate cross-day generalization).
-    *   **Regularization:** Early stopping is used to prevent the model from memorizing the specific session noise.
+### Phase 1: Hyperparameter Optimization and Ensemble
+*   **HP Search:** We perform a grid search using **5-Fold GroupKFold Cross-Validation** on pooled data from Sessions 1 and 2. Trial IDs are used as groups to prevent temporal leakage (ensuring the model doesn't see the same movie clip in both train and validation sets).
+*   **Multi-Seed Ensemble:** Every experiment is repeated across 5 random seeds. Final results (accuracies and importance scores) are averaged across this ensemble to minimize the impact of stochastic weight initialization.
 
-### Phase 2: Channel Importance Extraction
-Once the models are trained, we identify critical electrodes using two post-hoc interpretability methods:
-1.  **Permutation Importance (PI):** We systematically shuffle the data of one channel at a time in the test set and measure the drop in accuracy. Larger drops indicate higher importance.
-2.  **Integrated Gradients (IG):** We compute the gradient of the prediction with respect to the input features, providing a fine-grained attribution map.
-Importance scores are averaged across all subjects and random seeds to generate a **Grand Ranking**.
-*   **Stability Analysis:** Spearman rank correlation is calculated between different seeds to verify the consistency of the identified "hot spots."
+### Phase 2: Dual-Method Importance Extraction
+We identify critical electrodes using two complementary axiomatic and statistical methods:
+1.  **Permutation Importance (PI):** A global, model-agnostic method. We shuffle the temporal data of channel $i$ and observe the accuracy drop $\Delta Acc$. This captures both linear and non-linear dependencies.
+2.  **Integrated Gradients (IG):** An axiomatic attribution method. We calculate the integral of the gradients along the path from a baseline (zero input) to the actual input. This provides fine-grained, sample-level attribution that is then averaged.
+*   **Grand Ranking:** A final ranking is derived by averaging scores across all 15 subjects and 5 seeds.
+*   **Stability Diagnostics:** We use **Spearman Rho** to measure the correlation of rankings between seeds, ensuring that the identified "emotional hot spots" are consistent and reliable.
 
 ### Phase 3: Systematic Ablation Study
-We "ablate" (disable) sensors to test the following hypotheses:
-1.  **Regional Necessity:** Which lobes (Frontal, Temporal, etc.) can be removed with the least impact on accuracy?
-2.  **Hemisphere Asymmetry:** Does the model perform better using only the left or right hemisphere?
-3.  **Montage Practicality:** How does a research-grade 62-channel setup compare to standard 10-20 (19 ch), Emotiv EPOC (14 ch), and Muse (4 ch) configurations?
-4.  **Progressive Thinning:** We compare **Importance-guided removal** (removing least important first based on PI ranking) against **Random removal**. All results are averaged across the ensemble of models to ensure reliability.
+We systematically "ablate" (disable) sensors to test specific neuroscientific hypotheses:
+1.  **Regional Sensitivity:** Disabling specific regions (e.g., Prefrontal, Frontal, Parietal, Occipital). We test "Keep-Only" (sufficiency) and "Remove-Only" (necessity) scenarios.
+2.  **Hemispheric Asymmetry:** Comparing the predictive power of the Left vs. Right hemisphere to investigate lateralization of emotions.
+3.  **Montage Practicality:** Evaluating accuracy drops when restricted to hardware like the **Emotiv EPOC (14ch)** or **Muse (4ch)**.
+4.  **Progressive Thinning Curves:** We plot accuracy as a function of the number of remaining channels. We compare:
+    *   **PI-Guided:** Removing least important channels first.
+    *   **Random:** Averaged over 20 random permutations.
+    The gap between these curves quantifies the "Information Density" of our identified electrodes.
 
 ## 5. Statistical Validation
-To ensure findings are robust, results are analyzed using the **Wilcoxon Signed-Rank Test**. Because multiple comparisons are made (e.g., comparing several hardware montages), the **Holm-Bonferroni Correction** is applied to prevent "Type I" errors (false positives), ensuring that any reported performance difference is statistically sound.
+To distinguish genuine neurophysiological effects from random noise:
+*   **Wilcoxon Signed-Rank Test:** A non-parametric test used to compare the paired accuracies of the 15 subjects across different configurations (e.g., Full Cap vs. 10-20 Montage).
+*   **Holm-Bonferroni Correction:** Since we perform multiple comparisons, we adjust the p-values to control the Family-Wise Error Rate (FWER), ensuring that a reported significance of $p < 0.05$ is truly meaningful.
 
-## 6. Expected Deliverables
-*   **Topographic Heatmaps:** Visualizing where the "emotional brain" is most active (derived from PI and IG).
-*   **Ablation Curves:** Quantifying the trade-off between the number of sensors and system accuracy.
-*   **Hardware Recommendations:** Determining the optimal minimal electrode set for portable emotion-sensing headsets.
+## 6. Expected Deliverables and Impact
+*   **Topographic Importance Maps:** High-resolution heatmaps showing the dominance of Frontal and Temporal regions in emotion processing.
+*   **Ablation Curves:** Quantitative proof of the minimum sensor count (e.g., "12 channels achieve 90% of full-cap performance").
+*   **Hardware Design Guidelines:** A recommended "Minimal Emotion Montage" for developers building low-cost, portable BCI systems for mental health monitoring and affective computing.
