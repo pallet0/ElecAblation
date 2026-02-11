@@ -15,11 +15,20 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm  # rebind to tqdm.notebook below if --notebook
 
 from config import (
-    CHANNEL_NAMES, DATA_ROOT, EMOTIV_EPOC, HEMISPHERES, MNE_NAME_MAP,
+    CHANNEL_NAMES, DATA_ROOT, EMOTIV_EPOC, HEMISPHERES, LOBES, MNE_NAME_MAP,
     MUSE_APPROX, N_BANDS, N_CHANNELS, N_CLASSES, N_SESSIONS, N_SUBJECTS,
     REGIONS_FINE, SESSION_LABELS, STANDARD_1020,
 )
 from models import MLPBaseline
+
+
+def set_seed(seed):
+    """Set all random seeds for reproducibility."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 
 # ────────────────────────────────────────────────────────────────────
 # Data loading
@@ -434,6 +443,26 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
         print(f"  Region {region_name}: keep-only={np.mean(accs_keep):.4f}, "
               f"remove={np.mean(accs_rm):.4f}")
 
+    # Lobe keep-only and remove
+    for lobe_name, indices in LOBES.items():
+        mask_keep = make_channel_mask(indices, batch_size=1).to(device)
+        accs_keep = _eval_all_subjects(models, data, mask_keep, device)
+        all_results[f'lobe_keep_only_{lobe_name}'] = {
+            'n_channels': len(indices),
+            'mean': float(np.mean(accs_keep)), 'std': float(np.std(accs_keep)),
+            'per_subj': accs_keep,
+        }
+        remaining = sorted(all_ch - set(indices))
+        mask_rm = make_channel_mask(remaining, batch_size=1).to(device)
+        accs_rm = _eval_all_subjects(models, data, mask_rm, device)
+        all_results[f'lobe_remove_{lobe_name}'] = {
+            'n_channels': len(remaining),
+            'mean': float(np.mean(accs_rm)), 'std': float(np.std(accs_rm)),
+            'per_subj': accs_rm,
+        }
+        print(f"  Lobe {lobe_name}: keep-only={np.mean(accs_keep):.4f}, "
+              f"remove={np.mean(accs_rm):.4f}")
+
     # Hemisphere experiments
     for hemi_name, indices in HEMISPHERES.items():
         mask = make_channel_mask(indices, batch_size=1).to(device)
@@ -518,6 +547,23 @@ def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
             'per_subj': accs,
         }
         region_bar.set_postfix(config=config_name, acc=f'{np.mean(accs):.4f}')
+
+    # Lobe keep-only and remove
+    lobe_configs = []
+    for lobe_name, indices in LOBES.items():
+        lobe_configs.append((f'lobe_keep_only_{lobe_name}', indices))
+        remaining = sorted(all_ch - set(indices))
+        lobe_configs.append((f'lobe_remove_{lobe_name}', remaining))
+    lobe_bar = tqdm(lobe_configs, desc='  Retrain lobes')
+    for config_name, indices in lobe_bar:
+        accs = _retrain_all_subjects(data, indices, model_kwargs, train_kwargs,
+                                      device)
+        all_results[config_name] = {
+            'n_channels': len(indices),
+            'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
+            'per_subj': accs,
+        }
+        lobe_bar.set_postfix(config=config_name, acc=f'{np.mean(accs):.4f}')
 
     # Hemisphere experiments
     hemi_bar = tqdm(HEMISPHERES.items(), desc='  Retrain hemispheres')
@@ -719,6 +765,49 @@ def plot_region_ablation_table(results):
     plt.close()
 
 
+def plot_lobe_ablation_table(results):
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    lobes = list(LOBES.keys())
+
+    # Keep-only
+    ax = axes[0]
+    means = [results[f'lobe_keep_only_{l}']['mean'] for l in lobes]
+    stds = [results[f'lobe_keep_only_{l}']['std'] for l in lobes]
+    n_chs = [results[f'lobe_keep_only_{l}']['n_channels'] for l in lobes]
+    labels = [f'{l}\n({n}ch)' for l, n in zip(lobes, n_chs)]
+    ax.bar(range(len(lobes)), means, yerr=stds, capsize=3,
+           color='#3498db', alpha=0.8)
+    ax.set_xticks(range(len(lobes)))
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
+    ax.set_ylabel('Accuracy')
+    ax.set_title('Keep Only This Lobe')
+    ax.axhline(y=0.25, color='red', linestyle=':', alpha=0.5)
+
+    # Remove
+    ax = axes[1]
+    means = [results[f'lobe_remove_{l}']['mean'] for l in lobes]
+    stds = [results[f'lobe_remove_{l}']['std'] for l in lobes]
+    n_chs = [results[f'lobe_remove_{l}']['n_channels'] for l in lobes]
+    labels = [f'w/o {l}\n({n}ch)' for l, n in zip(lobes, n_chs)]
+    ax.bar(range(len(lobes)), means, yerr=stds, capsize=3,
+           color='#e67e22', alpha=0.8)
+    ax.set_xticks(range(len(lobes)))
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
+    ax.set_ylabel('Accuracy')
+    ax.set_title('Remove This Lobe')
+    full_acc = results['montage_full_62']['mean']
+    ax.axhline(y=full_acc, color='green', linestyle='--', alpha=0.7,
+               label=f'Full 62ch ({full_acc:.3f})')
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig('lobe_ablation.pdf', dpi=300, bbox_inches='tight')
+    print("Saved lobe_ablation.pdf")
+    plt.close()
+
+
 def plot_per_emotion_topomap(emotion_importances):
     import matplotlib.pyplot as plt
     import mne
@@ -786,6 +875,8 @@ if __name__ == '__main__':
                         help='Use tqdm.notebook for Colab/Jupyter')
     parser.add_argument('--retrain_ablation', action='store_true',
                         help='Run retrain-from-scratch ablation (expensive)')
+    parser.add_argument('--n_seeds', type=int, default=5,
+                        help='Number of random seeds for ensemble stability (default=5)')
     args = parser.parse_args()
 
     if args.notebook:
@@ -876,48 +967,167 @@ if __name__ == '__main__':
         print(f"Best MLP CV Acc: {best_mlp_score:.4f}")
         print(f"Best MLP config: {best_mlp_kwargs}, {best_mlp_train_kwargs}")
 
-    # ── Phase 2: Per-subject train/test (MLP only) ──
-    print("\n=== Phase 2: MLPBaseline ===")
-    mlp_results, mlp_models = train_and_evaluate(
-        data, MLPBaseline, best_mlp_kwargs, best_mlp_train_kwargs, device)
+    # ── Phases 2+3+3b: Multi-seed ensemble ──
+    n_seeds = args.n_seeds
+    print(f"\n=== Multi-seed ensemble: {n_seeds} seed(s) ===")
+    all_seed_models = []
+    all_seed_results = []
+    all_seed_importances = []
+    all_seed_ig_importances = []
+    all_seed_emotion_imp = []
 
-    # ── Phase 3: Permutation importance ──
-    print("\n=== Phase 3: Permutation importance ===")
-    importances = np.zeros((N_SUBJECTS, N_CHANNELS))
-    pi_bar = tqdm(range(1, N_SUBJECTS + 1), desc='PI subjects')
-    for subj in pi_bar:
-        X_test, y_test, _ = data[subj][3]
-        importances[subj - 1] = permutation_importance(
-            mlp_models[subj], X_test, y_test, device, n_repeats=10)
-        pi_bar.set_postfix(subj=subj)
-    grand_importance = importances.mean(axis=0)
+    for seed_idx in range(n_seeds):
+        seed = seed_idx + 1
+        set_seed(seed)
+        print(f"\n--- Seed {seed}/{n_seeds} ---")
+
+        # Phase 2: Per-subject train/test
+        print(f"  Phase 2: Training (seed {seed})")
+        results_k, models_k = train_and_evaluate(
+            data, MLPBaseline, best_mlp_kwargs, best_mlp_train_kwargs, device)
+        all_seed_results.append(results_k)
+        all_seed_models.append(models_k)
+
+        # Phase 3: Permutation importance
+        print(f"  Phase 3: Permutation importance (seed {seed})")
+        imp_k = np.zeros((N_SUBJECTS, N_CHANNELS))
+        pi_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'PI seed {seed}')
+        for subj in pi_bar:
+            X_test, y_test, _ = data[subj][3]
+            imp_k[subj - 1] = permutation_importance(
+                models_k[subj], X_test, y_test, device, n_repeats=10)
+        all_seed_importances.append(imp_k)
+
+        # Phase 3b: Integrated Gradients importance
+        print(f"  Phase 3b: Integrated Gradients (seed {seed})")
+        ig_k = np.zeros((N_SUBJECTS, N_CHANNELS))
+        ig_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'IG seed {seed}')
+        for subj in ig_bar:
+            X_test, y_test, _ = data[subj][3]
+            ig_k[subj - 1] = integrated_gradients_importance(
+                models_k[subj], X_test, y_test, device, n_steps=50)
+        all_seed_ig_importances.append(ig_k)
+
+        # Per-emotion PI
+        emo_k = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
+        emo_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'Emo-PI seed {seed}')
+        for subj in emo_bar:
+            X_test, y_test, _ = data[subj][3]
+            subj_emo = per_emotion_permutation_importance(
+                models_k[subj], X_test, y_test, device, n_repeats=10)
+            for c in subj_emo:
+                emo_k[c] += subj_emo[c]
+        for c in emo_k:
+            emo_k[c] /= N_SUBJECTS
+        all_seed_emotion_imp.append(emo_k)
+
+        # Per-seed summary
+        seed_grand = imp_k.mean(axis=0)
+        seed_ranking = seed_grand.argsort()[::-1]
+        print(f"  Seed {seed} top-5 PI: "
+              f"{[CHANNEL_NAMES[i] for i in seed_ranking[:5]]}")
+
+    # ── Aggregate importance across seeds ──
+    print("\n=== Aggregating across seeds ===")
+
+    # PI: (K, 62) — each row is one seed's grand avg over subjects
+    seed_grand_importances = np.array(
+        [imp.mean(axis=0) for imp in all_seed_importances])
+    grand_importance = seed_grand_importances.mean(axis=0)
+    importance_std = seed_grand_importances.std(axis=0)
     grand_ranking = grand_importance.argsort()[::-1].copy()
-    print("  Top-10 channels:", [CHANNEL_NAMES[i] for i in grand_ranking[:10]])
+    print("  Ensemble PI top-10:",
+          [CHANNEL_NAMES[i] for i in grand_ranking[:10]])
 
-    # ── Phase 3b: Integrated Gradients importance ──
-    print("\n=== Phase 3b: Integrated Gradients importance ===")
-    ig_importances = np.zeros((N_SUBJECTS, N_CHANNELS))
-    ig_bar = tqdm(range(1, N_SUBJECTS + 1), desc='IG subjects')
-    for subj in ig_bar:
-        X_test, y_test, _ = data[subj][3]
-        ig_importances[subj - 1] = integrated_gradients_importance(
-            mlp_models[subj], X_test, y_test, device, n_steps=50)
-        ig_bar.set_postfix(subj=subj)
-    grand_ig_importance = ig_importances.mean(axis=0)
+    # IG: same logic
+    seed_grand_ig = np.array(
+        [imp.mean(axis=0) for imp in all_seed_ig_importances])
+    grand_ig_importance = seed_grand_ig.mean(axis=0)
+    ig_importance_std = seed_grand_ig.std(axis=0)
     grand_ig_ranking = grand_ig_importance.argsort()[::-1].copy()
-    print("  IG Top-10 channels:", [CHANNEL_NAMES[i] for i in grand_ig_ranking[:10]])
+    print("  Ensemble IG top-10:",
+          [CHANNEL_NAMES[i] for i in grand_ig_ranking[:10]])
 
-    # ── Phase 4: Full ablation study ──
+    # Test accuracy: per-subject average across seeds
+    mlp_results = {}
+    for subj in range(1, N_SUBJECTS + 1):
+        mlp_results[subj] = float(np.mean(
+            [sr[subj] for sr in all_seed_results]))
+    accs = list(mlp_results.values())
+    print(f"  Ensemble mean accuracy: {np.mean(accs):.4f} "
+          f"+/- {np.std(accs):.4f}")
+
+    # Per-emotion importance: average across seeds
+    grand_emotion_imp = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
+    for emo_k in all_seed_emotion_imp:
+        for c in emo_k:
+            grand_emotion_imp[c] += emo_k[c]
+    for c in grand_emotion_imp:
+        grand_emotion_imp[c] /= n_seeds
+
+    # ── Cross-seed stability diagnostics ──
+    if n_seeds > 1:
+        from scipy.stats import spearmanr
+        rhos = []
+        for i in range(n_seeds):
+            for j in range(i + 1, n_seeds):
+                rho, _ = spearmanr(seed_grand_importances[i],
+                                   seed_grand_importances[j])
+                rhos.append(rho)
+        print(f"  Cross-seed PI rank stability: mean Spearman rho = "
+              f"{np.mean(rhos):.4f} "
+              f"(min={np.min(rhos):.4f}, max={np.max(rhos):.4f})")
+        ig_rhos = []
+        for i in range(n_seeds):
+            for j in range(i + 1, n_seeds):
+                rho, _ = spearmanr(seed_grand_ig[i], seed_grand_ig[j])
+                ig_rhos.append(rho)
+        print(f"  Cross-seed IG rank stability: mean Spearman rho = "
+              f"{np.mean(ig_rhos):.4f} "
+              f"(min={np.min(ig_rhos):.4f}, max={np.max(ig_rhos):.4f})")
+
+    # ── Phase 4: Full ablation study (averaged across seeds) ──
     print("\n=== Phase 4: Ablation study ===")
-    ablation_results = run_full_ablation_study(
-        mlp_models, data, grand_ranking, device)
+    all_seed_ablations = []
+    for seed_idx in range(n_seeds):
+        print(f"  Ablation with seed {seed_idx + 1} models...")
+        abl_k = run_full_ablation_study(
+            all_seed_models[seed_idx], data, grand_ranking, device)
+        all_seed_ablations.append(abl_k)
+
+    # Average ablation results across seeds
+    ablation_results = {}
+    first_abl = all_seed_ablations[0]
+    for key in first_abl:
+        if key.startswith('progressive_'):
+            curve = {}
+            step_keys = list(first_abl[key].keys())
+            for nk in step_keys:
+                means_k = [abl[key][nk]['mean'] for abl in all_seed_ablations]
+                stds_k = [abl[key][nk]['std'] for abl in all_seed_ablations]
+                curve[nk] = {
+                    'mean': float(np.mean(means_k)),
+                    'std': float(np.mean(stds_k)),
+                }
+            ablation_results[key] = curve
+        else:
+            per_subj_stacked = np.array(
+                [abl[key]['per_subj'] for abl in all_seed_ablations])
+            avg_per_subj = per_subj_stacked.mean(axis=0).tolist()
+            ablation_results[key] = {
+                'n_channels': first_abl[key]['n_channels'],
+                'mean': float(np.mean(avg_per_subj)),
+                'std': float(np.std(avg_per_subj)),
+                'per_subj': avg_per_subj,
+            }
 
     # ── Phase 4b: Retrain-from-scratch ablation (optional) ──
     retrain_ablation_results = None
     if args.retrain_ablation:
         print("\n=== Phase 4b: Retrain-from-scratch ablation ===")
         retrain_ablation_results = run_retrain_ablation_study(
-            data, grand_ranking, best_mlp_kwargs, best_mlp_train_kwargs, device)
+            data, grand_ranking, best_mlp_kwargs, best_mlp_train_kwargs,
+            device)
 
     # ── Phase 5: Visualization & statistics ──
     print("\n=== Phase 5: Visualization ===")
@@ -927,20 +1137,7 @@ if __name__ == '__main__':
                                 title='Integrated Gradients Importance (Grand Average)',
                                 filename='topomap_importance_IG.pdf')
     plot_region_ablation_table(ablation_results)
-
-    # Per-emotion permutation importance (grand average across subjects)
-    print("Computing per-emotion permutation importance...")
-    grand_emotion_imp = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
-    emo_bar = tqdm(range(1, N_SUBJECTS + 1), desc='Per-emotion PI')
-    for subj in emo_bar:
-        X_test, y_test, _ = data[subj][3]
-        subj_emo = per_emotion_permutation_importance(
-            mlp_models[subj], X_test, y_test, device, n_repeats=10)
-        for c in subj_emo:
-            grand_emotion_imp[c] += subj_emo[c]
-        emo_bar.set_postfix(subj=subj)
-    for c in grand_emotion_imp:
-        grand_emotion_imp[c] /= N_SUBJECTS
+    plot_lobe_ablation_table(ablation_results)
     plot_per_emotion_topomap(grand_emotion_imp)
 
     if retrain_ablation_results is not None:
@@ -975,17 +1172,22 @@ if __name__ == '__main__':
     adjusted_p = np.minimum(adjusted_p, 1.0)
     for i, (cfg_a, cfg_b, stat, raw_p) in enumerate(test_rows):
         adj_p = adjusted_p[i]
-        sig = '***' if adj_p < 0.001 else '**' if adj_p < 0.01 else '*' if adj_p < 0.05 else 'n.s.'
-        print(f"  {cfg_a} vs {cfg_b}: p={raw_p:.4f} (adj={adj_p:.4f}) {sig}")
+        sig = ('***' if adj_p < 0.001 else '**' if adj_p < 0.01
+               else '*' if adj_p < 0.05 else 'n.s.')
+        print(f"  {cfg_a} vs {cfg_b}: p={raw_p:.4f} "
+              f"(adj={adj_p:.4f}) {sig}")
 
     # Save all results
     save_results = {
+        'n_seeds': n_seeds,
         'mlp_per_subject': {str(k): v for k, v in mlp_results.items()},
         'mlp_mean': float(np.mean(list(mlp_results.values()))),
         'grand_ranking': grand_ranking.tolist(),
         'grand_importance': grand_importance.tolist(),
+        'importance_std': importance_std.tolist(),
         'grand_ig_importance': grand_ig_importance.tolist(),
         'grand_ig_ranking': grand_ig_ranking.tolist(),
+        'ig_importance_std': ig_importance_std.tolist(),
         'ablation': ablation_results,
         'best_mlp_kwargs': best_mlp_kwargs,
         'best_mlp_train_kwargs': best_mlp_train_kwargs,

@@ -1,10 +1,12 @@
 # Models Explanation (`models.py`)
 
-This document explains the deep learning models used in the EEG ablation study. The goal is to classify emotions from EEG signals. The core innovation here is the use of **Attention Mechanisms**, which allow the model to "focus" on specific parts of the brain (channels) that are most important for emotion, rather than treating all parts equally.
+This document explains the deep learning models available in the EEG ablation study. The goal is to classify emotions from EEG signals.
+
+**Note:** The current active pipeline (`main.py`) uses the **MLPBaseline** model and extracts channel importance via **Permutation Importance** and **Integrated Gradients**. The Attention-based models described below are available architectures that can be swapped in for future experiments.
 
 ## 1. `ChannelAttentionEEGNet`
 
-This is the main model. It learns which EEG electrodes (channels) are important.
+This model uses an attention mechanism to "learn" which channels are important.
 
 ### The Concept: What is Attention?
 Imagine you are listening to a crowded room. To understand a specific conversation, you "tune out" the background noise and "focus" on one person's voice.
@@ -107,15 +109,15 @@ class ChannelAttentionEEGNet(nn.Module):
 
 ## 2. `MLPBaseline`
 
-This is a "dumb" model for comparison.
+This is the primary model used in `main.py` for the ablation study.
 
 ```python
 class MLPBaseline(nn.Module):
     def __init__(self, input_dim=310, ...):
         # input_dim = 62 channels * 5 bands = 310 numbers
 ```
-*   **Logic:** It takes all 310 numbers, flattens them into a single long list, and feeds them into a standard Neural Network.
-*   **Why compare?** It proves that the "structure" of the brain matters. This model treats "Channel 1 Band 1" and "Channel 62 Band 5" as just random numbers in a list, without knowing they come from specific locations.
+*   **Logic:** It takes all 310 numbers, flattens them into a single long list, and feeds them into a standard Neural Network (Multi-Layer Perceptron).
+*   **Why use this?** By using a standard model without intrinsic attention, we can apply model-agnostic interpretability methods like **Permutation Importance** and **Integrated Gradients** to objectively measure which channels contribute most to the accuracy. This avoids relying on the model's internal "attention weights" which can sometimes be misleading.
 
 ---
 

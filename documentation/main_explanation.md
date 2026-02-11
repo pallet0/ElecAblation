@@ -30,6 +30,7 @@ This file runs the entire scientific experiment. It connects data loading, model
 *   **Key Detail:** `evaluate` accepts a `channel_mask`.
     *   When training, we usually use no mask (mask=None), letting the model learn from the whole brain.
     *   When testing specifically for ablation, we pass the mask to see how the model fails without certain channels.
+*   **MixUp Augmentation:** The training loop supports MixUp, a technique where pairs of examples are blended (interpolated) to encourage the model to behave linearly between training points.
 
 ## 4. The Experiment Phases
 
@@ -49,20 +50,26 @@ The script runs in 5 distinct phases.
     *   This gives a robust estimate of "how good this configuration is generally."
 
 ### Phase 2: Per-Subject Training
-*   **Goal:** Train a personalized model for each of the 15 subjects.
+*   **Goal:** Train personalized `MLPBaseline` models for each of the 15 subjects.
+*   **Multi-Seed Ensemble:** To ensure results are robust and not dependent on a single random initialization, the pipeline now supports training across multiple random seeds (controlled by `--n_seeds`).
 *   **Data Split:**
     *   **Train:** Session 1 + Session 2.
     *   **Test:** Session 3.
-*   **Why?** EEG varies wildly between people. A generic "one-size-fits-all" model often fails. We train 15 separate models.
+*   **Why?** EEG varies wildly between people. A generic "one-size-fits-all" model often fails. We train 15 separate models (multiplied by the number of seeds).
 *   **Early Stopping:** If the model stops improving on the test set, we stop training to prevent "overfitting" (memorizing noise).
 
 ### Phase 3: Extracting Importance
-*   **Goal:** Ask the trained models: "Which channels did you find useful?"
-*   **Method:**
+*   **Goal:** Ask the trained `MLPBaseline` models: "Which channels did you find useful?"
+*   **Method 1: Permutation Importance (PI):**
     *   Run the test data through the model.
-    *   Collect the `alpha` (attention weights) from the model.
-    *   Average them over time.
-    *   **Grand Ranking:** Average the importance across all 15 subjects to find the universally important brain areas.
+    *   Shuffle the data for *one specific channel* (destroying its information).
+    *   Measure how much the accuracy *drops*. If it drops a lot, that channel was important.
+*   **Method 2: Integrated Gradients (IG):**
+    *   A sophisticated method that looks at the gradient (slope) of the output with respect to the input.
+    *   It mathematically attributes the prediction to input features.
+*   **Ensemble Aggregation:** Importance scores are averaged across all seeds and all subjects.
+*   **Stability Diagnostics:** If multiple seeds are used, the script calculates **Spearman Rank Correlation** between different seeds to measure how consistent the electrode rankings are.
+*   **Grand Ranking:** The final averaged importance scores are used to find the universally important brain areas.
 
 ### Phase 4: Full Ablation Study (The Core Experiment)
 Now we test the scientific hypotheses using `run_full_ablation_study`.
@@ -84,13 +91,13 @@ Now we test the scientific hypotheses using `run_full_ablation_study`.
 
 #### D. Progressive Ablation (The "Curve")
 *   **Question:** "How many channels do we *really* need? 10? 20?"
-*   **Strategy 1 (Smart):** Keep the top 5 most important channels (from Phase 3), then top 10, top 15...
+*   **Strategy 1 (PI-Guided):** Keep the top 5 most important channels (ranked by Permutation Importance), then top 10, top 15...
 *   **Strategy 2 (Random):** Keep 5 random channels, 10 random...
-*   **Expectation:** The "Smart" curve should rise much faster than the "Random" curve. This proves our Attention mechanism actually found meaningful signals.
+*   **Expectation:** The "PI-Guided" curve should rise much faster than the "Random" curve. This proves our importance ranking actually found meaningful signals.
 
 ### Phase 5: Visualization
 *   Generates PDFs to visualize the results:
-    *   `topomap_attention.pdf`: A heatmap of the brain showing hot spots.
+    *   `topomap_importance.pdf` & `topomap_importance_IG.pdf`: Heatmaps of the brain showing hot spots (from PI and IG).
     *   `progressive_ablation.pdf`: A line graph showing accuracy vs number of channels.
     *   `region_ablation.pdf`: Bar charts comparing brain regions.
 
