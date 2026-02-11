@@ -1,5 +1,3 @@
-"""Complete pipeline for EEG electrode ablation study on SEED-IV."""
-
 import argparse
 import json
 from pathlib import Path
@@ -8,6 +6,7 @@ import numpy as np
 import scipy.io as sio
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm  # rebind to tqdm.notebook below if --notebook
@@ -21,7 +20,6 @@ from models import SOGNN
 
 
 def set_seed(seed):
-    """Set all random seeds for reproducibility."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -211,35 +209,38 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
 
 @torch.no_grad()
 def permutation_importance(model, X, y, device, n_repeats=10):
-    """Compute permutation importance for each of 62 channels.
+    """Compute permutation importance for each channel (loss-based).
+
+    Uses cross-entropy loss instead of accuracy for continuous, tie-free
+    importance values. Positive = important (shuffling increases loss).
 
     Args:
         model: trained SOGNN
-        X: numpy array (N, 62, 5, T_FIXED)
+        X: numpy array (N, C, 5, T_FIXED)
         y: numpy array (N,)
         device: torch device
         n_repeats: number of shuffle repeats per channel
-    Returns: (62,) array where positive = important (shuffling hurts accuracy)
+    Returns: (C,) array where positive = important (shuffling hurts loss)
     """
     model.eval()
     X_t = torch.tensor(X, dtype=torch.float32, device=device)
     y_t = torch.tensor(y, dtype=torch.long, device=device)
     N = X_t.size(0)
-    # Baseline accuracy
+    # Baseline loss
     logits = model(X_t)
-    baseline_acc = (logits.argmax(1) == y_t).float().mean().item()
+    baseline_loss = F.cross_entropy(logits, y_t).item()
     n_channels = X.shape[1]
     importances = np.zeros(n_channels)
     for ch in range(n_channels):
-        shuffled_accs = []
+        shuffled_losses = []
         for _ in range(n_repeats):
             X_perm = X_t.clone()
             perm_idx = torch.randperm(N, device=device)
             X_perm[:, ch, :, :] = X_perm[perm_idx, ch, :, :]
             logits = model(X_perm)
-            acc = (logits.argmax(1) == y_t).float().mean().item()
-            shuffled_accs.append(acc)
-        importances[ch] = baseline_acc - float(np.mean(shuffled_accs))
+            loss = F.cross_entropy(logits, y_t).item()
+            shuffled_losses.append(loss)
+        importances[ch] = float(np.mean(shuffled_losses)) - baseline_loss
     return importances
 
 
@@ -651,7 +652,8 @@ def plot_topographic_importance(grand_importance,
     info, picks = _make_topo_info()
     fig, ax = plt.subplots(1, 1, figsize=(6, 6))
     mne.viz.plot_topomap(grand_importance[picks], info, axes=ax, show=False,
-                         cmap='RdYlBu_r', contours=0)
+                         cmap='RdYlBu_r', contours=0, extrapolate='head',
+                         outlines='head', sensors=True)
     ax.set_title(title, fontsize=13)
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"Saved {filename}")
@@ -747,15 +749,21 @@ def plot_lobe_ablation_table(results):
 def plot_per_emotion_topomap(emotion_importances):
     import matplotlib.pyplot as plt
     import mne
+    from scipy.stats import rankdata
 
     info, picks = _make_topo_info()
     emotion_labels = {0: 'Neutral', 1: 'Sad', 2: 'Fear', 3: 'Happy'}
     fig, axes = plt.subplots(1, N_CLASSES, figsize=(5 * N_CLASSES, 5))
     for c in range(N_CLASSES):
-        mne.viz.plot_topomap(emotion_importances[c][picks], info, axes=axes[c],
-                             show=False, cmap='RdYlBu_r', contours=0)
+        raw = emotion_importances[c][picks]
+        ranked = rankdata(raw) / len(raw)  # rank-normalize to [0, 1]
+        mne.viz.plot_topomap(ranked, info, axes=axes[c],
+                             show=False, cmap='RdYlBu_r', contours=0,
+                             vlim=(0, 1), extrapolate='head',
+                             outlines='head', sensors=True)
         axes[c].set_title(emotion_labels.get(c, str(c)), fontsize=13)
-    plt.suptitle('Per-Emotion Permutation Importance', fontsize=15, y=1.02)
+    plt.suptitle('Per-Emotion Permutation Importance (rank-normalized)',
+                 fontsize=15, y=1.02)
     plt.tight_layout()
     plt.savefig('per_emotion_topomap.pdf', dpi=300, bbox_inches='tight')
     print("Saved per_emotion_topomap.pdf")
