@@ -274,48 +274,6 @@ def _eval_all_subjects(models, data, mask, device):
     return accs
 
 
-def _retrain_loso(data, channel_indices, model_kwargs, train_kwargs, device):
-    """LOSO retrain: for each fold, train on 14 subjects' selected channels,
-    test on held-out subject. Returns list of 15 accuracies."""
-    n_ch = len(channel_indices)
-    ch_idx = list(channel_indices)
-    mk = {**model_kwargs, 'n_electrodes': n_ch}
-    accs = []
-    for test_subj in range(1, N_SUBJECTS + 1):
-        X_train = np.concatenate([data[s][sess][0][:, ch_idx, :, :]
-                                  for s in range(1, N_SUBJECTS + 1)
-                                  if s != test_subj
-                                  for sess in range(1, N_SESSIONS + 1)])
-        y_train = np.concatenate([data[s][sess][1]
-                                  for s in range(1, N_SUBJECTS + 1)
-                                  if s != test_subj
-                                  for sess in range(1, N_SESSIONS + 1)])
-        X_test = np.concatenate([data[test_subj][sess][0][:, ch_idx, :, :]
-                                 for sess in range(1, N_SESSIONS + 1)])
-        y_test = np.concatenate([data[test_subj][sess][1]
-                                 for sess in range(1, N_SESSIONS + 1)])
-
-        tr_loader = DataLoader(
-            TensorDataset(torch.tensor(X_train), torch.tensor(y_train)),
-            batch_size=train_kwargs['batch_size'], shuffle=True)
-        te_loader = DataLoader(
-            TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
-            batch_size=512, shuffle=False)
-
-        model = SOGNN(**mk).to(device)
-        optimizer = torch.optim.Adam(model.parameters(),
-                                     lr=train_kwargs['lr'],
-                                     weight_decay=train_kwargs['wd'])
-        criterion = nn.CrossEntropyLoss()
-        auc_threshold = train_kwargs.get('auc_threshold', 0.99)
-        for epoch in range(train_kwargs['max_epochs']):
-            _, train_acc = train_one_epoch(model, tr_loader, optimizer, criterion, device)
-            train_auc = compute_training_auc(model, tr_loader, device)
-            if train_auc >= auc_threshold and train_acc > 0.90:
-                break
-        accs.append(evaluate(model, te_loader, device))
-    return accs
-
 
 def find_knee_point(x, y):
     """Find the knee point using maximum perpendicular distance to the chord.
@@ -508,117 +466,12 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
     return all_results
 
 
-def run_retrain_ablation_study(data, grand_ranking, model_kwargs, train_kwargs,
-                               device='cuda'):
-    """Retrain-from-scratch ablation: fresh LOSO model per config. Returns dict of results."""
-    all_results = {}
-    all_ch = set(range(N_CHANNELS))
-
-    # Region keep-only and remove
-    region_configs = []
-    for region_name, indices in REGIONS_FINE.items():
-        region_configs.append((f'keep_only_{region_name}', indices))
-        remaining = sorted(all_ch - set(indices))
-        region_configs.append((f'remove_{region_name}', remaining))
-    region_bar = tqdm(region_configs, desc='  Retrain regions')
-    for config_name, indices in region_bar:
-        accs = _retrain_loso(data, indices, model_kwargs, train_kwargs, device)
-        all_results[config_name] = {
-            'n_channels': len(indices),
-            'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
-            'per_subj': accs,
-        }
-        region_bar.set_postfix(config=config_name, acc=f'{np.mean(accs):.4f}')
-
-    # Lobe keep-only and remove
-    lobe_configs = []
-    for lobe_name, indices in LOBES.items():
-        lobe_configs.append((f'lobe_keep_only_{lobe_name}', indices))
-        remaining = sorted(all_ch - set(indices))
-        lobe_configs.append((f'lobe_remove_{lobe_name}', remaining))
-    lobe_bar = tqdm(lobe_configs, desc='  Retrain lobes')
-    for config_name, indices in lobe_bar:
-        accs = _retrain_loso(data, indices, model_kwargs, train_kwargs, device)
-        all_results[config_name] = {
-            'n_channels': len(indices),
-            'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
-            'per_subj': accs,
-        }
-        lobe_bar.set_postfix(config=config_name, acc=f'{np.mean(accs):.4f}')
-
-    # Hemisphere experiments
-    hemi_bar = tqdm(HEMISPHERES.items(), desc='  Retrain hemispheres')
-    for hemi_name, indices in hemi_bar:
-        accs = _retrain_loso(data, indices, model_kwargs, train_kwargs, device)
-        all_results[f'hemisphere_{hemi_name}'] = {
-            'n_channels': len(indices),
-            'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
-            'per_subj': accs,
-        }
-        hemi_bar.set_postfix(hemi=hemi_name, acc=f'{np.mean(accs):.4f}')
-
-    # Standard montage subsets
-    montages = {
-        'full_62': list(range(N_CHANNELS)),
-        'standard_1020_19': STANDARD_1020,
-        'emotiv_epoc_14': EMOTIV_EPOC,
-        'muse_approx_4': MUSE_APPROX,
-    }
-    mont_bar = tqdm(montages.items(), desc='  Retrain montages')
-    for mont_name, indices in mont_bar:
-        accs = _retrain_loso(data, indices, model_kwargs, train_kwargs, device)
-        all_results[f'montage_{mont_name}'] = {
-            'n_channels': len(indices),
-            'mean': float(np.mean(accs)), 'std': float(np.std(accs)),
-            'per_subj': accs,
-        }
-        mont_bar.set_postfix(montage=mont_name, acc=f'{np.mean(accs):.4f}')
-
-    # Progressive attention-guided (fewer steps to manage cost)
-    n_keep_steps = [62, 50, 40, 30, 20, 10, 5, 1]
-    for strategy_name, ranking in [
-        ('pi_least_first', grand_ranking),
-        ('pi_most_first', grand_ranking[::-1]),
-    ]:
-        curve = {}
-        step_bar = tqdm(n_keep_steps, desc=f'  Retrain {strategy_name}')
-        for n_keep in step_bar:
-            keep = ranking[:n_keep].tolist()
-            accs = _retrain_loso(data, keep, model_kwargs, train_kwargs, device)
-            curve[n_keep] = {'mean': float(np.mean(accs)),
-                             'std': float(np.std(accs))}
-            step_bar.set_postfix(n_keep=n_keep, acc=f'{np.mean(accs):.4f}')
-        all_results[f'progressive_{strategy_name}'] = curve
-        print(f"  Progressive retrain {strategy_name}: done")
-
-    # Progressive random (5 seeds x 8 levels)
-    curve_random = {}
-    rand_bar = tqdm(n_keep_steps, desc='  Retrain random')
-    for n_keep in rand_bar:
-        subj_means = np.zeros(N_SUBJECTS)
-        for seed in range(5):
-            rng = np.random.RandomState(seed)
-            keep = rng.choice(N_CHANNELS, n_keep, replace=False).tolist()
-            accs = _retrain_loso(data, keep, model_kwargs, train_kwargs, device)
-            subj_means += np.array(accs)
-        subj_means /= 5
-        curve_random[n_keep] = {
-            'mean': float(np.mean(subj_means)),
-            'std': float(np.std(subj_means)),
-        }
-        rand_bar.set_postfix(n_keep=n_keep, acc=f'{np.mean(subj_means):.4f}')
-    all_results['progressive_random'] = curve_random
-    print("  Progressive retrain random: done")
-
-    return all_results
-
 
 # ────────────────────────────────────────────────────────────────────
 # Visualization (Phase 5)
 # ────────────────────────────────────────────────────────────────────
 
-def plot_progressive_ablation_curves(results, retrain_results=None,
-                                     knee_analysis=None):
+def plot_progressive_ablation_curves(results, knee_analysis=None):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
@@ -627,22 +480,10 @@ def plot_progressive_ablation_curves(results, retrain_results=None,
         ('progressive_random',         '#95a5a6', 'Random',         '-', 'o'),
         ('progressive_pi_most_first',  '#e74c3c', 'PI most first',  '-', 'o'),
     ]
-    if retrain_results is not None:
-        curves_to_plot.extend([
-            ('retrain_progressive_pi_least_first', '#2ecc71', 'Retrain (least first)', '--', '^'),
-            ('retrain_progressive_random',         '#95a5a6', 'Retrain random',        '--', '^'),
-            ('retrain_progressive_pi_most_first',  '#e74c3c', 'Retrain (most first)',  '--', '^'),
-        ])
-    # Merge retrain curves into a combined dict for lookup
-    _all_curves = dict(results)
-    if retrain_results is not None:
-        for k, v in retrain_results.items():
-            if k.startswith('progressive_'):
-                _all_curves[f'retrain_{k}'] = v
     for key, color, label, ls, marker in curves_to_plot:
-        if key not in _all_curves:
+        if key not in results:
             continue
-        curve = _all_curves[key]
+        curve = results[key]
         n_ch = sorted(curve.keys(), key=int)
         x_vals = [int(n) for n in n_ch]
         means = [curve[n]['mean'] for n in n_ch]
@@ -914,38 +755,6 @@ def plot_per_subject_accuracy(sognn_results):
     plt.close()
 
 
-def plot_retrain_comparison(mask_results, retrain_results):
-    """Grouped bar chart: mask-based vs retrain accuracy for montage subsets."""
-    import matplotlib.pyplot as plt
-
-    montage_keys = ['montage_full_62', 'montage_standard_1020_19',
-                    'montage_emotiv_epoc_14', 'montage_muse_approx_4']
-    labels = ['62ch (full)', '19ch (10-20)', '14ch (EPOC)', '4ch (Muse)']
-    mask_means = [mask_results[k]['mean'] for k in montage_keys]
-    mask_stds = [mask_results[k]['std'] for k in montage_keys]
-    retrain_means = [retrain_results[k]['mean'] for k in montage_keys]
-    retrain_stds = [retrain_results[k]['std'] for k in montage_keys]
-
-    x = np.arange(len(labels))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(x - width / 2, mask_means, width, yerr=mask_stds, capsize=4,
-           label='Mask-based', color='#3498db', alpha=0.85)
-    ax.bar(x + width / 2, retrain_means, width, yerr=retrain_stds, capsize=4,
-           label='Retrain from scratch', color='#e67e22', alpha=0.85)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel('Accuracy')
-    ax.set_title('Mask-Based vs Retrain-from-Scratch Ablation')
-    ax.legend()
-    ax.axhline(y=0.25, color='black', linestyle=':', alpha=0.5)
-    ax.set_ylim(0.15, 0.75)
-    ax.grid(True, alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.savefig('retrain_comparison.pdf', dpi=300, bbox_inches='tight')
-    print("Saved retrain_comparison.pdf")
-    plt.close()
-
 
 def plot_per_subject_knee(knee_analysis):
     """Bar chart of per-subject knee channel counts."""
@@ -1059,8 +868,6 @@ if __name__ == '__main__':
                         help='Device (default: auto-detect)')
     parser.add_argument('--notebook', action='store_true',
                         help='Use tqdm.notebook for Colab/Jupyter')
-    parser.add_argument('--retrain_ablation', action='store_true',
-                        help='Run retrain-from-scratch ablation (expensive)')
     parser.add_argument('--n_seeds', type=int, default=5,
                         help='Number of random seeds for ensemble stability (default=5)')
     args = parser.parse_args()
@@ -1239,18 +1046,10 @@ if __name__ == '__main__':
                 'per_subj': avg_per_subj,
             }
 
-    # ── Phase 4b: Retrain-from-scratch ablation (optional) ──
-    retrain_ablation_results = None
-    if args.retrain_ablation:
-        print("\n=== Phase 4b: Retrain-from-scratch ablation (LOSO) ===")
-        retrain_ablation_results = run_retrain_ablation_study(
-            data, grand_ranking, model_kwargs, train_kwargs, device)
-
     # ── Phase 5: Visualization & statistics ──
     print("\n=== Phase 5: Visualization ===")
     knee_analysis = compute_knee_analysis(ablation_results)
-    plot_progressive_ablation_curves(ablation_results, retrain_ablation_results,
-                                     knee_analysis)
+    plot_progressive_ablation_curves(ablation_results, knee_analysis)
     plot_topographic_importance(grand_importance)
     plot_region_ablation_table(ablation_results)
     plot_lobe_ablation_table(ablation_results)
@@ -1260,8 +1059,6 @@ if __name__ == '__main__':
     plot_knee_explanation(knee_analysis, ablation_results)
     plot_per_subject_knee(knee_analysis)
 
-    if retrain_ablation_results is not None:
-        plot_retrain_comparison(ablation_results, retrain_ablation_results)
 
     # Wilcoxon signed-rank tests with Holm-Bonferroni correction
     print("\n=== Statistical tests (Wilcoxon, Holm-Bonferroni corrected) ===")
@@ -1319,8 +1116,6 @@ if __name__ == '__main__':
         'model_kwargs': model_kwargs,
         'train_kwargs': train_kwargs,
     }
-    if retrain_ablation_results is not None:
-        save_results['ablation_retrain'] = retrain_ablation_results
     with open('results.json', 'w') as f:
         json.dump(save_results, f, indent=2)
     print("\nSaved results.json")
