@@ -1,6 +1,6 @@
 # SOGNN EEG Electrode Ablation Study (SEED-IV)
 
-This project implements a pipeline for EEG electrode ablation studies on the SEED-IV dataset using a **Self-Organized Graph Neural Network (SOGNN)**(Jingcong Li et al., 2021).
+This project implements a pipeline for EEG electrode ablation studies on the SEED-IV dataset using a **Self-Organized Graph Neural Network (SOGNN)**(J. Li et al., 2021).
 
 ## Quick Start
 
