@@ -1,49 +1,40 @@
-# models.md Documentation
+# Model Architecture (`models.py`)
 
-This file defines the Deep Neural Network architectures used for EEG emotion classification, specifically the Self-Organized Graph Neural Network (SOGNN).
+This project utilizes the **Self-Organized Graph Neural Network (SOGNN)**, as proposed by Li et al. (2021), adapted for electrode ablation studies.
 
-## `SOGC` (Self-Organized Graph Convolution) Class
+## SOGC: Self-Organized Graph Convolution
 
-The `SOGC` layer dynamically learns a sparse adjacency matrix from electrode features instead of using a fixed graph structure.
+The core of SOGNN is the SOGC layer, which learns a dynamic graph structure for every input sample rather than using a fixed, distance-based adjacency matrix.
 
-### Initialization (`__init__`)
-- `n_electrodes`: Number of nodes (electrodes) in the graph.
-- `in_features`: Dimension of the input features for each node.
-- `bn_features`: Dimension of the bottleneck layer used to compute the adjacency matrix.
-- `out_features`: Dimension of the output features after graph convolution.
-- `top_k`: The number of neighbors to retain for each node (enforces sparsity).
-- `self.bn`: A linear layer that projects node features into a bottleneck space for similarity computation.
-- `self.gc`: A linear layer that performs the graph convolution (message passing).
+### Adjacency Learning Mechanism
+1. **Bottleneck Projection**: Node features are projected into a lower-dimensional space using a linear layer and a `tanh` activation.
+2. **Similarity Computation**: A similarity matrix is computed via a batched dot-product: $A = \text{softmax}(G \cdot G^T)$.
+3. **Top-k Sparsification**: For each electrode, only the $k$ most significant connections (default $k=10$) are kept. This ensures the graph remains sparse and focuses on the most relevant electrode-to-electrode relationships.
+4. **Self-Loops**: Diagonal elements are set to 1.0 to ensure nodes retain their own feature information during message passing.
 
-### Forward Pass (`forward`)
-1. **Feature Reshaping**: Reshapes input `x` (B*E, C, H, W) into (B, E, Features).
-2. **Adjacency Computation**:
-   - Projects features through a bottleneck and applies `tanh`.
-   - Computes a self-attention-like matrix using dot-product similarity (`g @ g^T`).
-   - Applies `softmax` to normalize the connections.
-3. **Sparsification**: Keeps only the `top_k` strongest connections for each node using `topk` and `scatter_`.
-4. **Self-loops**: Adds self-loops by setting the diagonal of the adjacency matrix to 1.0.
-5. **Graph Convolution**: Performs the operation $Y = 	ext{ReLU}(A \cdot X \cdot W)$, where $A$ is the learned adjacency matrix.
+### Graph Convolution
+The convolution follows the standard formulation: $H' = \text{ReLU}(A \cdot H \cdot W)$, where $A$ is the learned sparse adjacency and $W$ is the weight matrix.
 
----
+## SOGNN: System Integration
 
-## `SOGNN` (Self-Organized Graph Neural Network) Class
+The SOGNN model combines a 2D CNN backbone with multiple SOGC branches to capture multi-scale spatial and temporal features.
 
-The main model architecture that combines multi-scale CNN branches with SOGC layers.
+### 1. Per-Electrode CNN Processing
+Before any graph operations, each electrode's $(Bands \times Time)$ map is processed independently by a series of convolutional and max-pooling layers. This prevents feature mixing between electrodes in the early stages and allows the model to extract clean spectral-temporal features.
 
-### Initialization (`__init__`)
-- **CNN Blocks**: Three convolutional layers (`conv1`, `conv2`, `conv3`) with different kernel sizes to extract features at multiple temporal/spectral scales.
-- **Dynamic Dimension Calculation**: Uses a dummy forward pass to determine the input sizes for subsequent SOGC layers.
-- **SOGC Branches**: Three parallel SOGC layers (`sogc1`, `sogc2`, `sogc3`) that process features from different depths of the CNN backbone.
-- **Classifier**: A final linear layer that concatenates the outputs from all three SOGC branches to produce class logits.
+### 2. Multi-Scale Parallel Branches
+SOGNN uses three parallel branches that tap into different depths of the CNN backbone:
+- **Branch 1**: Low-level features (from `conv1`).
+- **Branch 2**: Mid-level features (from `conv2`).
+- **Branch 3**: High-level features (from `conv3`).
 
-### Forward Pass (`forward`)
-1. **Input Reshaping**: Reshapes the input EEG data (Batch, Electrodes, Bands, Time) into a per-electrode format for the CNN stage.
-2. **Multi-scale Feature Extraction**:
-   - **Branch 1**: Passes data through `conv1`, `ReLU`, `dropout`, and `pool`, then feeds the result into `sogc1`.
-   - **Branch 2**: Continues from the previous CNN output through `conv2`, `ReLU`, `dropout`, and `pool`, then feeds the result into `sogc2`.
-   - **Branch 3**: Continues through `conv3`, `ReLU`, `dropout`, and `pool`, then feeds the result into `sogc3`.
-3. **Fusion and Classification**:
-   - Concatenates the graph-convolved features from the three scales.
-   - Flattens the representation and applies a dropout layer.
-   - Passes the result through the final linear classifier to obtain logits for the 4 emotion classes.
+Each branch passes its features through a dedicated SOGC layer, allowing the model to reason about electrode relationships at different levels of abstraction.
+
+### 3. Feature Fusion
+The outputs from all three SOGC branches are concatenated and flattened. This result is passed through a final linear classifier to produce the 4 emotion logits.
+
+## Design for Ablation
+
+The model is designed to be **electrode-count agnostic**:
+- **Dynamic Dimensioning**: During initialization, a dummy forward pass is used to calculate the flatten dimensions, ensuring the model can be instantiated with any number of electrodes (e.g., for retrain-from-scratch ablation).
+- **Masking Compatibility**: The forward pass accepts 4D tensors, allowing the pipeline to apply binary masks to specific channels without altering the underlying graph construction logic for the remaining channels.

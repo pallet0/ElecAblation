@@ -35,7 +35,9 @@
       "WebFetch(domain:christophm.github.io)",
       "WebFetch(domain:eli5.readthedocs.io)",
       "WebFetch(domain:rasbt.github.io)",
-      "WebFetch(domain:www.mathworks.com)"
+      "WebFetch(domain:www.mathworks.com)",
+      "Bash(pip install:*)",
+      "Bash(copy:*)"
     ]
   }
 }

@@ -1,40 +1,64 @@
-# config.py Documentation
+# Configuration and Mappings (`config.py`)
 
-This file contains the constants, electrode mappings, and regional groupings used for the SEED-IV EEG emotion recognition ablation study.
+This document details the constants, electrode layouts, and regional groupings used to ensure consistency across the SOGNN pipeline.
 
-## EEG Channel Layout
-- `CHANNEL_NAMES`: A list of 62 EEG electrode names following the SEED-IV layout.
-- `N_CHANNELS`: Total number of EEG channels (62).
-- `N_BANDS`: Number of frequency bands (5: delta, theta, alpha, beta, gamma) used for Differential Entropy (DE) features.
-- `N_CLASSES`: Number of emotion classes (4: neutral, sad, fear, happy).
-- `N_SUBJECTS`: Number of subjects in the SEED-IV dataset (15).
-- `N_SESSIONS`: Number of sessions per subject (3).
-- `T_FIXED`: Temporal padding length (64) for the SOGNN model input.
+## Dataset Constants (SEED-IV)
 
-## Data Configuration
-- `DATA_ROOT`: The directory path where the SEED-IV preprocessed features (`eeg_feature_smooth`) are stored.
-- `SESSION_LABELS`: A nested list containing the ground truth labels for the 24 trials in each of the 3 sessions.
+| Constant | Value | Description |
+| :--- | :--- | :--- |
+| `N_CHANNELS` | 62 | Total number of EEG channels. |
+| `N_BANDS` | 5 | Frequency bands: Delta, Theta, Alpha, Beta, Gamma. |
+| `N_CLASSES` | 4 | Emotion classes: Neutral (0), Sad (1), Fear (2), Happy (3). |
+| `N_SUBJECTS` | 15 | Total participants in the dataset. |
+| `N_SESSIONS` | 3 | Separate recording sessions per participant. |
+| `T_FIXED` | 64 | Temporal padding length for SOGNN input (64 frames). |
 
-## Regional Groupings (Electrode Subsets)
-These groupings are used to analyze the contribution of different brain areas to emotion recognition.
+## Electrode Layout
 
-### `REGIONS_FINE`
-A dictionary mapping 8 non-overlapping longitudinal strips (from anterior to posterior) to their corresponding channel indices:
+`CHANNEL_NAMES` defines the 62-channel sequence as provided in the SEED-IV `.mat` files. These indices are used throughout the pipeline for masking and importance ranking.
+
+```python
+CHANNEL_NAMES = [
+    'FP1','FPZ','FP2','AF3','AF4',                          # 0-4
+    'F7','F5','F3','F1','FZ','F2','F4','F6','F8',           # 5-13
+    'FT7','FC5','FC3','FC1','FCZ','FC2','FC4','FC6','FT8',  # 14-22
+    'T7','C5','C3','C1','CZ','C2','C4','C6','T8',           # 23-31
+    'TP7','CP5','CP3','CP1','CPZ','CP2','CP4','CP6','TP8',  # 32-40
+    'P7','P5','P3','P1','PZ','P2','P4','P6','P8',           # 41-49
+    'PO7','PO5','PO3','POZ','PO4','PO6','PO8',              # 50-56
+    'CB1','O1','OZ','O2','CB2'                               # 57-61
+]
+```
+
+## Regional and Anatomical Groupings
+
+These groupings are used in Phase 4 (Ablation Study) to evaluate the impact of removing or keeping specific brain areas.
+
+### 1. Fine-grained Regions (`REGIONS_FINE`)
+8 non-overlapping longitudinal strips from anterior to posterior:
 - `prefrontal`, `frontal`, `frontal_central`, `central`, `central_parietal`, `parietal`, `parietal_occipital`, `occipital`.
 
-### `HEMISPHERES`
-A dictionary mapping brain hemispheres to channel indices:
-- `left`, `right`, and `midline`.
+### 2. Hemispheres (`HEMISPHERES`)
+- `left`: 27 channels.
+- `midline`: 8 channels.
+- `right`: 27 channels.
 
-### `LOBES`
-Anatomical lobe groupings:
-- `frontal`, `temporal`, `central`, `parietal`, `occipital`.
+### 3. Anatomical Lobes (`LOBES`)
+Groupings based on standard brain anatomy:
+- `frontal`: Fp + AF + F electrodes.
+- `temporal`: FT7/8, T7/8, TP7/8.
+- `central`: FC, C, CP electrodes.
+- `parietal`: P electrodes.
+- `occipital`: PO, CB, O electrodes.
 
-## Standard Montage Subsets
-Indices for common reduced electrode configurations:
-- `STANDARD_1020`: The international 10-20 system (19 channels).
-- `EMOTIV_EPOC`: The 14-channel layout used by the Emotiv EPOC headset.
-- `MUSE_APPROX`: A 4-channel approximation of the Muse headband.
+## Montage Subsets
 
-## MNE Mapping
-- `MNE_NAME_MAP`: Maps SEED-IV channel names to standard MNE names for compatibility with topographic plotting libraries.
+Commercial and standard electrode configurations used for comparison:
+- `STANDARD_1020`: International 10-20 system (19 channels).
+- `EMOTIV_EPOC`: 14 channels used by Emotiv headsets.
+- `MUSE_APPROX`: 4 channels approximating the Muse headband.
+
+## Visualization Metadata
+
+- `MNE_NAME_MAP`: Dictionary mapping SEED-IV names (e.g., `FPZ`) to standard MNE-compatible names (e.g., `Fpz`) for accurate topographic plotting.
+- `SESSION_LABELS`: The ground-truth emotion labels for each of the 24 trials across the 3 sessions, as defined in the SEED-IV ReadMe.

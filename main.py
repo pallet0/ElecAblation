@@ -255,45 +255,6 @@ def per_emotion_permutation_importance(model, X, y, device,
     return result
 
 
-def integrated_gradients_importance(model, X, y, device, n_steps=50,
-                                    batch_size=24):
-    """Compute Integrated Gradients channel importance.
-
-    Args:
-        model: trained SOGNN
-        X: numpy array (N, 62, 5, T_FIXED)
-        y: numpy array (N,)
-        device: torch device
-        n_steps: interpolation steps (default 50)
-        batch_size: batch size for forward/backward passes (default 24)
-    Returns: (62,) array — per-channel importance (positive = important)
-    """
-    model.eval()
-    X_t = torch.tensor(X, dtype=torch.float32, device=device)  # (N, 62, 5, T)
-    y_t = torch.tensor(y, dtype=torch.long, device=device)
-    N = X_t.shape[0]
-
-    accum = torch.zeros_like(X_t)  # (N, 62, 5, T)
-
-    for step in range(1, n_steps + 1):
-        alpha = step / n_steps
-        for start in range(0, N, batch_size):
-            end = min(start + batch_size, N)
-            x_interp = (alpha * X_t[start:end]).detach().requires_grad_(True)
-            logits = model(x_interp)
-            target_logits = logits.gather(1, y_t[start:end].unsqueeze(1)).squeeze(1)
-            target_logits.sum().backward()
-            accum[start:end] += x_interp.grad.detach()
-
-    # IG = (input - baseline) * avg_grad; baseline=0 → input * avg_grad
-    avg_grad = accum / n_steps       # (N, 62, 5, T)
-    ig = X_t * avg_grad              # (N, 62, 5, T)
-
-    # Per-channel: sum |IG| over bands and time, mean over samples
-    channel_importance = ig.abs().sum(dim=(2, 3)).mean(dim=0)  # (62,)
-    return channel_importance.cpu().numpy()
-
-
 # ────────────────────────────────────────────────────────────────────
 # Ablation study (Phase 4)
 # ────────────────────────────────────────────────────────────────────
@@ -438,8 +399,7 @@ def compute_knee_analysis(ablation_results,
     }
 
 
-def run_full_ablation_study(models, data, grand_ranking, device='cuda',
-                            ig_ranking=None):
+def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
     """Run all ablation experiments. Returns dict of results."""
     all_results = {}
     all_ch = set(range(N_CHANNELS))
@@ -527,23 +487,6 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda',
                             'per_subj': accs}
         all_results[f'progressive_{strategy_name}'] = curve
         print(f"  Progressive {strategy_name}: done")
-
-    # Progressive ablation (IG-guided: least first, most first)
-    if ig_ranking is not None:
-        for strategy_name, ranking in [
-            ('ig_least_first', ig_ranking),
-            ('ig_most_first', ig_ranking[::-1]),
-        ]:
-            curve = {}
-            for n_keep in n_keep_steps:
-                keep = ranking[:n_keep].tolist()
-                mask = make_channel_mask(keep, batch_size=1).to(device)
-                accs = _eval_all_subjects(models, data, mask, device)
-                curve[n_keep] = {'mean': float(np.mean(accs)),
-                                 'std': float(np.std(accs)),
-                                 'per_subj': accs}
-            all_results[f'progressive_{strategy_name}'] = curve
-            print(f"  Progressive {strategy_name}: done")
 
     # Random ablation (20 repeats per step, averaged per subject first)
     curve_random = {}
@@ -1104,151 +1047,6 @@ def plot_knee_explanation(knee_analysis, ablation_results):
     plt.close()
 
 
-def plot_progressive_ablation_curves_ig(results, knee_analysis_ig=None):
-    """Plot progressive ablation curves for IG-guided strategies."""
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-    curves_to_plot = [
-        ('progressive_ig_least_first', '#3498db', 'IG least first', '-', 'o'),
-        ('progressive_random',         '#95a5a6', 'Random',         '-', 'o'),
-        ('progressive_ig_most_first',  '#e74c3c', 'IG most first',  '-', 'o'),
-    ]
-    for key, color, label, ls, marker in curves_to_plot:
-        if key not in results:
-            continue
-        curve = results[key]
-        n_ch = sorted(curve.keys(), key=int)
-        x_vals = [int(n) for n in n_ch]
-        means = [curve[n]['mean'] for n in n_ch]
-        stds = [curve[n]['std'] for n in n_ch]
-        ax.plot(x_vals, means, marker=marker, color=color, label=label,
-                linewidth=2, linestyle=ls)
-        ax.fill_between(x_vals,
-                        [m - s for m, s in zip(means, stds)],
-                        [m + s for m, s in zip(means, stds)],
-                        alpha=0.15, color=color)
-    if knee_analysis_ig is not None:
-        mk = knee_analysis_ig['mean_knee']
-        ax.plot(mk['knee_x'], mk['knee_y'], marker='D', color='#8e44ad',
-                markersize=10, zorder=5, label='Knee point')
-        ax.annotate(f"{mk['knee_x']}ch ({mk['knee_y']:.3f})",
-                    xy=(mk['knee_x'], mk['knee_y']),
-                    xytext=(mk['knee_x'] + 5, mk['knee_y'] - 0.06),
-                    arrowprops=dict(arrowstyle='->', color='#8e44ad', lw=1.5),
-                    fontsize=10, color='#8e44ad', fontweight='bold')
-    ax.axhline(y=0.25, color='black', linestyle=':', alpha=0.5,
-               label='Chance (4-class)')
-    ax.set_xlabel('Number of Remaining Channels', fontsize=12)
-    ax.set_ylabel('Accuracy', fontsize=12)
-    ax.set_title('Progressive Electrode Ablation (IG-Guided)', fontsize=14)
-    ax.legend(fontsize=9)
-    ax.set_xlim(0, 65)
-    ax.set_ylim(0.2, 0.85)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig('progressive_ablation_ig.pdf', dpi=300, bbox_inches='tight')
-    print("Saved progressive_ablation_ig.pdf")
-    plt.close()
-
-
-def plot_knee_explanation_ig(knee_analysis_ig, ablation_results):
-    """Two-panel diagram explaining the IG knee-point method."""
-    import matplotlib.pyplot as plt
-
-    curve = ablation_results['progressive_ig_least_first']
-    sorted_nk = sorted(curve.keys(), key=int, reverse=True)
-    x_vals = np.array([int(nk) for nk in sorted_nk])
-    mean_acc = np.array([curve[nk]['mean'] for nk in sorted_nk])
-    mk = knee_analysis_ig['mean_knee']
-    distances = mk['distances']
-    knee_idx = mk['knee_index']
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Left panel: curve + chord + perpendicular distances
-    ax1.plot(x_vals, mean_acc, 'o-', color='#3498db', linewidth=2,
-             label='IG least first')
-    ax1.plot([x_vals[0], x_vals[-1]], [mean_acc[0], mean_acc[-1]],
-             '--', color='#7f8c8d', linewidth=1.5, label='Chord')
-    x0, y0 = float(x_vals[0]), float(mean_acc[0])
-    x1, y1 = float(x_vals[-1]), float(mean_acc[-1])
-    dx, dy = x1 - x0, y1 - y0
-    chord_len_sq = dx ** 2 + dy ** 2
-    for i in range(len(x_vals)):
-        if distances[i] < 1e-8:
-            continue
-        t = ((x_vals[i] - x0) * dx + (mean_acc[i] - y0) * dy) / chord_len_sq
-        foot_x = x0 + t * dx
-        foot_y = y0 + t * dy
-        color = '#e74c3c' if i == knee_idx else '#bdc3c7'
-        lw = 2.0 if i == knee_idx else 0.8
-        ax1.plot([x_vals[i], foot_x], [mean_acc[i], foot_y],
-                 color=color, linewidth=lw, alpha=0.7)
-    ax1.plot(mk['knee_x'], mk['knee_y'], 'D', color='#8e44ad',
-             markersize=12, zorder=5, label=f"Knee ({mk['knee_x']}ch)")
-    ax1.set_xlabel('Number of Remaining Channels', fontsize=12)
-    ax1.set_ylabel('Accuracy', fontsize=12)
-    ax1.set_title('IG Knee Detection: Max Distance to Chord', fontsize=13)
-    ax1.legend(fontsize=9)
-    ax1.grid(True, alpha=0.3)
-
-    # Right panel: bar chart of perpendicular distances
-    bar_colors = ['#e74c3c' if i == knee_idx else '#3498db'
-                  for i in range(len(x_vals))]
-    ax2.bar(range(len(x_vals)), distances, color=bar_colors, alpha=0.8)
-    ax2.set_xticks(range(len(x_vals)))
-    ax2.set_xticklabels([str(int(xv)) for xv in x_vals], fontsize=8,
-                        rotation=45)
-    ax2.set_xlabel('Number of Remaining Channels', fontsize=12)
-    ax2.set_ylabel('Perpendicular Distance', fontsize=12)
-    ax2.set_title('Distance to Chord at Each Step', fontsize=13)
-    ax2.grid(True, alpha=0.3, axis='y')
-
-    plt.tight_layout()
-    plt.savefig('knee_explanation_ig.pdf', dpi=300, bbox_inches='tight')
-    print("Saved knee_explanation_ig.pdf")
-    plt.close()
-
-
-def plot_per_subject_knee_ig(knee_analysis_ig):
-    """Bar chart of per-subject knee channel counts (IG-based)."""
-    import matplotlib.pyplot as plt
-
-    knees = knee_analysis_ig['per_subject_knees']
-    subjects = [sk['subject'] for sk in knees]
-    channels = [sk['knee_channels'] for sk in knees]
-    mean_subj_knee = knee_analysis_ig['knee_summary']['mean']
-    mean_curve_knee = knee_analysis_ig['mean_knee']['knee_x']
-
-    vmin, vmax = min(channels), max(channels)
-    if vmax > vmin:
-        normed = [(c - vmin) / (vmax - vmin) for c in channels]
-    else:
-        normed = [0.5] * len(channels)
-    colors = plt.cm.RdYlGn(normed)
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(range(len(subjects)), channels, color=colors, edgecolor='gray',
-           linewidth=0.5)
-    ax.axhline(y=mean_subj_knee, color='black', linestyle='--', linewidth=1.5,
-               label=f'Mean of subject knees = {mean_subj_knee:.1f}')
-    ax.axhline(y=mean_curve_knee, color='#8e44ad', linestyle=':', linewidth=1.5,
-               label=f'Mean-curve knee = {mean_curve_knee}')
-    ax.set_xticks(range(len(subjects)))
-    ax.set_xticklabels([f'S{s:02d}' for s in subjects], fontsize=9)
-    ax.set_ylabel('Knee Channel Count', fontsize=12)
-    ax.set_title('Per-Subject Optimal Channel Count (IG Knee Point)',
-                 fontsize=13)
-    ax.set_ylim(0, max(channels) + 5)
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.savefig('per_subject_knee_ig.pdf', dpi=300, bbox_inches='tight')
-    print("Saved per_subject_knee_ig.pdf")
-    plt.close()
-
-
 # ────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ────────────────────────────────────────────────────────────────────
@@ -1310,7 +1108,6 @@ if __name__ == '__main__':
     all_seed_models = []
     all_seed_results = []
     all_seed_importances = []
-    all_seed_ig_importances = []
     all_seed_emotion_imp = []
 
     for seed_idx in range(n_seeds):
@@ -1338,19 +1135,6 @@ if __name__ == '__main__':
                 models_k[subj], X_test, y_test, device, n_repeats=10)
         all_seed_importances.append(imp_k)
 
-        # Phase 3b: Integrated Gradients importance
-        print(f"  Phase 3b: Integrated Gradients (seed {seed})")
-        ig_k = np.zeros((N_SUBJECTS, N_CHANNELS))
-        ig_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'IG seed {seed}')
-        for subj in ig_bar:
-            X_test = np.concatenate([data[subj][sess][0]
-                                     for sess in range(1, N_SESSIONS + 1)])
-            y_test = np.concatenate([data[subj][sess][1]
-                                     for sess in range(1, N_SESSIONS + 1)])
-            ig_k[subj - 1] = integrated_gradients_importance(
-                models_k[subj], X_test, y_test, device, n_steps=50)
-        all_seed_ig_importances.append(ig_k)
-
         # Per-emotion PI
         emo_k = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
         emo_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'Emo-PI seed {seed}')
@@ -1375,7 +1159,6 @@ if __name__ == '__main__':
 
         # Cumulative topomaps (running average of seeds 1..current)
         plot_cumulative_topomaps(all_seed_importances, seed_idx, 'pi')
-        plot_cumulative_topomaps(all_seed_ig_importances, seed_idx, 'ig')
 
     # ── Aggregate importance across seeds ──
     print("\n=== Aggregating across seeds ===")
@@ -1388,15 +1171,6 @@ if __name__ == '__main__':
     grand_ranking = grand_importance.argsort()[::-1].copy()
     print("  Ensemble PI top-10:",
           [CHANNEL_NAMES[i] for i in grand_ranking[:10]])
-
-    # IG: same logic
-    seed_grand_ig = np.array(
-        [imp.mean(axis=0) for imp in all_seed_ig_importances])
-    grand_ig_importance = seed_grand_ig.mean(axis=0)
-    ig_importance_std = seed_grand_ig.std(axis=0)
-    grand_ig_ranking = grand_ig_importance.argsort()[::-1].copy()
-    print("  Ensemble IG top-10:",
-          [CHANNEL_NAMES[i] for i in grand_ig_ranking[:10]])
 
     # Test accuracy: per-subject average across seeds
     sognn_results = {}
@@ -1427,14 +1201,6 @@ if __name__ == '__main__':
         print(f"  Cross-seed PI rank stability: mean Spearman rho = "
               f"{np.mean(rhos):.4f} "
               f"(min={np.min(rhos):.4f}, max={np.max(rhos):.4f})")
-        ig_rhos = []
-        for i in range(n_seeds):
-            for j in range(i + 1, n_seeds):
-                rho, _ = spearmanr(seed_grand_ig[i], seed_grand_ig[j])
-                ig_rhos.append(rho)
-        print(f"  Cross-seed IG rank stability: mean Spearman rho = "
-              f"{np.mean(ig_rhos):.4f} "
-              f"(min={np.min(ig_rhos):.4f}, max={np.max(ig_rhos):.4f})")
 
     # ── Phase 4: Full ablation study (averaged across seeds) ──
     print("\n=== Phase 4: Ablation study ===")
@@ -1442,8 +1208,7 @@ if __name__ == '__main__':
     for seed_idx in range(n_seeds):
         print(f"  Ablation with seed {seed_idx + 1} models...")
         abl_k = run_full_ablation_study(
-            all_seed_models[seed_idx], data, grand_ranking, device,
-            ig_ranking=grand_ig_ranking)
+            all_seed_models[seed_idx], data, grand_ranking, device)
         all_seed_ablations.append(abl_k)
 
     # Average ablation results across seeds
@@ -1487,9 +1252,6 @@ if __name__ == '__main__':
     plot_progressive_ablation_curves(ablation_results, retrain_ablation_results,
                                      knee_analysis)
     plot_topographic_importance(grand_importance)
-    plot_topographic_importance(grand_ig_importance,
-                                title='Integrated Gradients Importance (Grand Average)',
-                                filename='topomap_importance_IG.pdf')
     plot_region_ablation_table(ablation_results)
     plot_lobe_ablation_table(ablation_results)
     plot_per_emotion_topomap(grand_emotion_imp)
@@ -1497,12 +1259,6 @@ if __name__ == '__main__':
     plot_per_subject_accuracy(sognn_results)
     plot_knee_explanation(knee_analysis, ablation_results)
     plot_per_subject_knee(knee_analysis)
-
-    knee_analysis_ig = compute_knee_analysis(
-        ablation_results, 'progressive_ig_least_first', 'IG')
-    plot_progressive_ablation_curves_ig(ablation_results, knee_analysis_ig)
-    plot_knee_explanation_ig(knee_analysis_ig, ablation_results)
-    plot_per_subject_knee_ig(knee_analysis_ig)
 
     if retrain_ablation_results is not None:
         plot_retrain_comparison(ablation_results, retrain_ablation_results)
@@ -1550,9 +1306,6 @@ if __name__ == '__main__':
         'grand_ranking': grand_ranking.tolist(),
         'grand_importance': grand_importance.tolist(),
         'importance_std': importance_std.tolist(),
-        'grand_ig_importance': grand_ig_importance.tolist(),
-        'grand_ig_ranking': grand_ig_ranking.tolist(),
-        'ig_importance_std': ig_importance_std.tolist(),
         'ablation': ablation_results,
         'knee_analysis': {
             'mean_knee_channels': int(knee_analysis['mean_knee']['knee_x']),
@@ -1562,15 +1315,6 @@ if __name__ == '__main__':
             'mean_of_subject_knees': knee_analysis['knee_summary']['mean'],
             'std_of_subject_knees': knee_analysis['knee_summary']['std'],
             'median_of_subject_knees': knee_analysis['knee_summary']['median'],
-        },
-        'knee_analysis_ig': {
-            'mean_knee_channels': int(knee_analysis_ig['mean_knee']['knee_x']),
-            'mean_knee_accuracy': float(knee_analysis_ig['mean_knee']['knee_y']),
-            'per_subject_knee_channels': [sk['knee_channels']
-                                          for sk in knee_analysis_ig['per_subject_knees']],
-            'mean_of_subject_knees': knee_analysis_ig['knee_summary']['mean'],
-            'std_of_subject_knees': knee_analysis_ig['knee_summary']['std'],
-            'median_of_subject_knees': knee_analysis_ig['knee_summary']['median'],
         },
         'model_kwargs': model_kwargs,
         'train_kwargs': train_kwargs,
