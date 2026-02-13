@@ -4,37 +4,73 @@ This project utilizes the **Self-Organized Graph Neural Network (SOGNN)**, as pr
 
 ## SOGC: Self-Organized Graph Convolution
 
-The core of SOGNN is the SOGC layer, which learns a dynamic graph structure for every input sample rather than using a fixed, distance-based adjacency matrix.
+The core of SOGNN is the `SOGC` layer, which learns a dynamic graph structure for every input sample rather than using a fixed, distance-based adjacency matrix.
 
-### Adjacency Learning Mechanism
-1. **Bottleneck Projection**: Node features are projected into a lower-dimensional space using a linear layer and a `tanh` activation.
-2. **Similarity Computation**: A similarity matrix is computed via a batched dot-product: $A = \text{softmax}(G \cdot G^T)$.
-3. **Top-k Sparsification**: For each electrode, only the $k$ most significant connections (default $k=10$) are kept. This ensures the graph remains sparse and focuses on the most relevant electrode-to-electrode relationships.
-4. **Self-Loops**: Diagonal elements are set to 1.0 to ensure nodes retain their own feature information during message passing.
+```python
+class SOGC(nn.Module):
+    def __init__(self, n_electrodes, in_features, bn_features, out_features, top_k):
+        super().__init__()
+        self.n_electrodes = n_electrodes
+        self.top_k = min(top_k, n_electrodes)
+        self.bn = nn.Linear(in_features, bn_features)
+        self.gc = nn.Linear(in_features, out_features)
 
-### Graph Convolution
-The convolution follows the standard formulation: $H' = \text{ReLU}(A \cdot H \cdot W)$, where $A$ is the learned sparse adjacency and $W$ is the weight matrix.
+    def forward(self, x):
+        B_E = x.shape[0]
+        E = self.n_electrodes
+        B = B_E // E
+
+        # [Line 1] Flatten spatial dims: (B*E, C, H, W) -> (B, E, C*H*W)
+        h = x.reshape(B, E, -1)
+
+        # [Line 2] Compute adjacency: bottleneck -> tanh -> softmax -> top-k
+        g = torch.tanh(self.bn(h))                                # (B, E, bn)
+        a = torch.softmax(g @ g.transpose(-1, -2), dim=-1)       # (B, E, E)
+
+        # [Line 3] Top-k sparsification
+        vals, idxs = a.topk(self.top_k, dim=-1)                  # (B, E, k)
+        a_sparse = torch.zeros_like(a).scatter_(-1, idxs, vals)   # (B, E, E)
+
+        # [Line 4] Add self-loops: set diagonal to 1.0
+        eye = torch.eye(E, device=a.device, dtype=a.dtype).unsqueeze(0)
+        a_sparse = a_sparse * (1 - eye) + eye
+
+        # [Line 5] Graph convolution
+        out = torch.relu(self.gc(a_sparse @ h))                   # (B, E, out)
+        return out
+```
+
+### Line-by-Line Breakdown (SOGC)
+- **Line 1 (`h = x.reshape(...)`)**: Flattens the spatial/spectral features (Channels × Height × Width) into a single vector per electrode. This prepares the data for graph-level operations where each electrode is a node.
+- **Line 2 (`g = ...`, `a = ...`)**: `bn` projects features into a lower-dimensional bottleneck space to find relationships more efficiently. `g @ g.transpose` calculates the similarity between every electrode pair, and `softmax` ensures the total weight from one electrode to others sums to 1.
+- **Line 3 (`a_sparse = ...`)**: Only the `top_k` strongest connections are kept. `scatter_` places the original softmax values back into a zeroed matrix at the top-k indices, creating a sparse adjacency.
+- **Line 4 (`a_sparse * (1 - eye) + eye`)**: Sets the diagonal of the adjacency matrix to exactly 1.0. This ensures that during message passing, an electrode's own features are always preserved.
+- **Line 5 (`torch.relu(self.gc(a_sparse @ h))`)**: Performs the graph convolution. `a_sparse @ h` aggregates features from neighboring electrodes, and `self.gc` (a linear layer) applies the learnable transformation.
 
 ## SOGNN: System Integration
 
-The SOGNN model combines a 2D CNN backbone with multiple SOGC branches to capture multi-scale spatial and temporal features.
+The `SOGNN` model combines a 2D CNN backbone with multiple `SOGC` branches to capture multi-scale spatial and temporal features.
 
-### 1. Per-Electrode CNN Processing
-Before any graph operations, each electrode's $(Bands \times Time)$ map is processed independently by a series of convolutional and max-pooling layers. This prevents feature mixing between electrodes in the early stages and allows the model to extract clean spectral-temporal features.
+```python
+    def forward(self, x):
+        B, E = x.shape[0], x.shape[1]
 
-### 2. Multi-Scale Parallel Branches
-SOGNN uses three parallel branches that tap into different depths of the CNN backbone:
-- **Branch 1**: Low-level features (from `conv1`).
-- **Branch 2**: Mid-level features (from `conv2`).
-- **Branch 3**: High-level features (from `conv3`).
+        # [Line 6] Reshape to per-electrode: (B*E, 1, bands, T)
+        x = x.reshape(B * E, 1, x.shape[2], x.shape[3])
 
-Each branch passes its features through a dedicated SOGC layer, allowing the model to reason about electrode relationships at different levels of abstraction.
+        # [Line 7] Block 1 + SOGC1 branch
+        x = self.pool(self.drop(F.relu(self.conv1(x))))
+        x1 = self.sogc1(x)                              # (B, E, 32)
 
-### 3. Feature Fusion
-The outputs from all three SOGC branches are concatenated and flattened. This result is passed through a final linear classifier to produce the 4 emotion logits.
+        # [Line 8] Multi-scale concat + classify
+        out = torch.cat([x1, x2, x3], dim=-1)           # (B, E, 96)
+        out = self.drop(out)
+        out = out.reshape(B, -1)                         # (B, E * 96)
+        logits = self.classifier(out)                    # (B, n_classes)
+        return logits
+```
 
-## Design for Ablation
-
-The model is designed to be **electrode-count agnostic**:
-- **Dynamic Dimensioning**: During initialization, a dummy forward pass is used to calculate the flatten dimensions, ensuring the model can be instantiated with any number of electrodes (e.g., for retrain-from-scratch ablation).
-- **Masking Compatibility**: The forward pass accepts 4D tensors, allowing the pipeline to apply binary masks to specific channels without altering the underlying graph construction logic for the remaining channels.
+### Line-by-Line Breakdown (SOGNN)
+- **Line 6 (`x.reshape(...)`)**: Collapses the batch and electrode dimensions. This allows the 2D CNN to treat every single electrode from every trial as an independent image, ensuring the CNN only learns spectral-temporal patterns *within* an electrode, not across them.
+- **Line 7 (`x1 = self.sogc1(x)`)**: After CNN processing, the features are passed to the SOGC layer. SOGC internally restores the `(B, E)` structure to learn relationships *between* the processed electrode features.
+- **Line 8 (`torch.cat(...)`, `out.reshape(...)`)**: Concatenates features from low, mid, and high levels of the CNN. The final `reshape(B, -1)` flattens all electrodes and their multi-scale features into one long vector for the final classification decision.

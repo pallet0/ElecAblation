@@ -25,21 +25,9 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-# ────────────────────────────────────────────────────────────────────
-# Data loading
-# ────────────────────────────────────────────────────────────────────
+# --- Data loading ---
 
 def load_seed4_session(mat_path, session_idx):
-    """Load one session's DE features from a SEED-IV .mat file.
-
-    Each trial is one sample, zero-padded to T_FIXED and z-score normalized
-    (statistics computed from all frames before padding).
-
-    Args:
-        mat_path: path to the .mat file
-        session_idx: 0-based session index (for label lookup)
-    Returns: X (24, 62, 5, T_FIXED), y (24,), trial_ids (24,)
-    """
     data = sio.loadmat(mat_path)
     labels = SESSION_LABELS[session_idx]
     trials_raw = []  # list of (T_k, 62, 5) arrays
@@ -52,11 +40,10 @@ def load_seed4_session(mat_path, session_idx):
         trial_data = trial_data.transpose(1, 0, 2)  # -> (T_k, 62, 5)
         trials_raw.append(trial_data)
         y_list.append(labels[trial_idx])
-    # Compute z-score statistics from ALL frames before padding
+    # Z-score stats from all frames (before padding, so zeros = session mean)
     all_frames = np.concatenate(trials_raw, axis=0)  # (N_total, 62, 5)
     mean = all_frames.mean(axis=0, keepdims=True)    # (1, 62, 5)
     std = all_frames.std(axis=0, keepdims=True) + 1e-8
-    # Normalize each trial, zero-pad, and transpose to (62, 5, T_FIXED)
     X_list = []
     for trial in trials_raw:
         trial_normed = (trial - mean) / std           # (T_k, 62, 5)
@@ -76,20 +63,15 @@ def load_seed4_session(mat_path, session_idx):
     return X, y, trial_ids
 
 
-# ────────────────────────────────────────────────────────────────────
-# Masking utility
-# ────────────────────────────────────────────────────────────────────
+# --- Masking ---
 
 def make_channel_mask(active_indices, n_channels=N_CHANNELS, batch_size=1):
-    """Create a binary mask: 1.0 = keep, 0.0 = ablated."""
     mask = torch.zeros(batch_size, n_channels)
     mask[:, active_indices] = 1.0
     return mask
 
 
-# ────────────────────────────────────────────────────────────────────
-# Training / evaluation helpers
-# ────────────────────────────────────────────────────────────────────
+# --- Training / evaluation ---
 
 def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
@@ -124,7 +106,6 @@ def evaluate(model, loader, device, channel_mask=None):
 
 @torch.no_grad()
 def compute_training_auc(model, loader, device):
-    """Compute macro-averaged training AUC (OvR)."""
     model.eval()
     all_probs, all_labels = [], []
     for X_batch, y_batch in loader:
@@ -138,27 +119,20 @@ def compute_training_auc(model, loader, device):
     return roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro')
 
 
-# ────────────────────────────────────────────────────────────────────
-# LOSO train & evaluate (Phase 2)
-# ────────────────────────────────────────────────────────────────────
+# --- LOSO training ---
 
 def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda'):
-    """LOSO: for each subject, train on all other subjects, test on held-out.
-
-    Returns: (per_subject_accs dict, trained_models dict)
-    """
+    """LOSO cross-validation. Returns (per_subject_accs, trained_models)."""
     results = {}
     models = {}
     subj_bar = tqdm(range(1, N_SUBJECTS + 1), desc='LOSO folds')
     for test_subj in subj_bar:
-        # Pool ALL sessions from all OTHER subjects
         X_train = np.concatenate([data[s][sess][0]
                                   for s in range(1, N_SUBJECTS + 1) if s != test_subj
                                   for sess in range(1, N_SESSIONS + 1)])
         y_train = np.concatenate([data[s][sess][1]
                                   for s in range(1, N_SUBJECTS + 1) if s != test_subj
                                   for sess in range(1, N_SESSIONS + 1)])
-        # Pool ALL sessions from held-out subject
         X_test = np.concatenate([data[test_subj][sess][0]
                                  for sess in range(1, N_SESSIONS + 1)])
         y_test = np.concatenate([data[test_subj][sess][1]
@@ -202,25 +176,11 @@ def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda
     return results, models
 
 
-# ────────────────────────────────────────────────────────────────────
-# Permutation importance (Phase 3 / Phase 5)
-# ────────────────────────────────────────────────────────────────────
+# --- Permutation importance ---
 
 @torch.no_grad()
 def permutation_importance(model, X, y, device, n_repeats=10):
-    """Compute permutation importance for each channel (accuracy-based).
-
-    Shuffles each channel's feature block across samples and measures accuracy
-    drop. Positive = important (baseline_acc - shuffled_acc).
-
-    Args:
-        model: trained SOGNN
-        X: numpy array (N, C, 5, T_FIXED)
-        y: numpy array (N,)
-        device: torch device
-        n_repeats: number of shuffle repeats per channel
-    Returns: (C,) array, positive = important
-    """
+    """Shuffle each channel across samples, measure accuracy drop."""
     model.eval()
     X_t = torch.tensor(X, dtype=torch.float32, device=device)
     y_t = torch.tensor(y, dtype=torch.long, device=device)
@@ -243,8 +203,6 @@ def permutation_importance(model, X, y, device, n_repeats=10):
 @torch.no_grad()
 def per_emotion_permutation_importance(model, X, y, device,
                                         n_repeats=10, n_classes=N_CLASSES):
-    """Permutation importance per emotion class.
-    Returns {class_id: (62,) array}."""
     result = {}
     for c in range(n_classes):
         mask_c = (y == c)
@@ -255,12 +213,9 @@ def per_emotion_permutation_importance(model, X, y, device,
     return result
 
 
-# ────────────────────────────────────────────────────────────────────
-# Ablation study (Phase 4)
-# ────────────────────────────────────────────────────────────────────
+# --- Ablation study ---
 
 def _eval_all_subjects(models, data, mask, device):
-    """Evaluate all LOSO folds with a given channel mask. Returns list of 15 accuracies."""
     accs = []
     for subj in range(1, N_SUBJECTS + 1):
         X_test = np.concatenate([data[subj][sess][0]
@@ -276,30 +231,17 @@ def _eval_all_subjects(models, data, mask, device):
 
 
 def find_knee_point(x, y):
-    """Find the knee point using maximum perpendicular distance to the chord.
-
-    Draws a chord from the first to the last data point and finds the point
-    with the greatest perpendicular distance from the chord.
-
-    Args:
-        x: 1D array of x-values (e.g. number of channels), ordered
-        y: 1D array of y-values (e.g. accuracy)
-    Returns:
-        dict with knee_x, knee_y, knee_index, distances
-    """
+    """Max perpendicular distance from the first-to-last chord."""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    # Chord from first to last point
     x0, y0 = x[0], y[0]
     x1, y1 = x[-1], y[-1]
     dx, dy = x1 - x0, y1 - y0
     denom = np.sqrt(dx ** 2 + dy ** 2)
     if denom < 1e-12:
-        # Degenerate: flat line — pick midpoint
         idx = len(x) // 2
         return {'knee_x': x[idx], 'knee_y': y[idx], 'knee_index': idx,
                 'distances': np.zeros(len(x))}
-    # Perpendicular distance from each point to the chord line
     distances = np.abs(dy * x - dx * y + (x1 * y0 - x0 * y1)) / denom
     idx = int(np.argmax(distances))
     return {'knee_x': x[idx], 'knee_y': y[idx], 'knee_index': idx,
@@ -308,21 +250,14 @@ def find_knee_point(x, y):
 
 def compute_knee_analysis(ablation_results,
                           curve_key='progressive_pi_least_first', label='PI'):
-    """Compute knee-point analysis on a progressive ablation curve.
-
-    Returns dict with mean_knee, per_subject_knees, and knee_summary.
-    """
     curve = ablation_results[curve_key]
-    # Sort by n_keep descending (62 → 1)
     sorted_nk = sorted(curve.keys(), key=int, reverse=True)
     x_vals = np.array([int(nk) for nk in sorted_nk])
     mean_acc = np.array([curve[nk]['mean'] for nk in sorted_nk])
 
-    # Mean-curve knee
     mean_knee = find_knee_point(x_vals, mean_acc)
     mean_knee['knee_x'] = int(mean_knee['knee_x'])
 
-    # Per-subject knees
     per_subject_knees = []
     for subj_idx in range(N_SUBJECTS):
         subj_acc = np.array([curve[nk]['per_subj'][subj_idx]
@@ -358,11 +293,9 @@ def compute_knee_analysis(ablation_results,
 
 
 def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
-    """Run all ablation experiments. Returns dict of results."""
     all_results = {}
     all_ch = set(range(N_CHANNELS))
 
-    # Region keep-only and remove
     for region_name, indices in REGIONS_FINE.items():
         mask_keep = make_channel_mask(indices, batch_size=1).to(device)
         accs_keep = _eval_all_subjects(models, data, mask_keep, device)
@@ -382,7 +315,6 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
         print(f"  Region {region_name}: keep-only={np.mean(accs_keep):.4f}, "
               f"remove={np.mean(accs_rm):.4f}")
 
-    # Lobe keep-only and remove
     for lobe_name, indices in LOBES.items():
         mask_keep = make_channel_mask(indices, batch_size=1).to(device)
         accs_keep = _eval_all_subjects(models, data, mask_keep, device)
@@ -402,7 +334,6 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
         print(f"  Lobe {lobe_name}: keep-only={np.mean(accs_keep):.4f}, "
               f"remove={np.mean(accs_rm):.4f}")
 
-    # Hemisphere experiments
     for hemi_name, indices in HEMISPHERES.items():
         mask = make_channel_mask(indices, batch_size=1).to(device)
         accs = _eval_all_subjects(models, data, mask, device)
@@ -413,7 +344,6 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
         }
         print(f"  Hemisphere {hemi_name}: {np.mean(accs):.4f}")
 
-    # Standard montage subsets
     montages = {
         'full_62': list(range(N_CHANNELS)),
         'standard_1020_19': STANDARD_1020,
@@ -430,7 +360,6 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
         }
         print(f"  Montage {mont_name}: {np.mean(accs):.4f}")
 
-    # Progressive ablation (PI-guided: least first, most first)
     n_keep_steps = [62, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 8, 5, 3, 1]
     for strategy_name, ranking in [
         ('pi_least_first', grand_ranking),
@@ -446,7 +375,6 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
         all_results[f'progressive_{strategy_name}'] = curve
         print(f"  Progressive {strategy_name}: done")
 
-    # Random ablation (20 repeats per step, averaged per subject first)
     curve_random = {}
     for n_keep in n_keep_steps:
         subj_means = np.zeros(N_SUBJECTS)
@@ -467,9 +395,7 @@ def run_full_ablation_study(models, data, grand_ranking, device='cuda'):
 
 
 
-# ────────────────────────────────────────────────────────────────────
-# Visualization (Phase 5)
-# ────────────────────────────────────────────────────────────────────
+# --- Visualization ---
 
 def plot_progressive_ablation_curves(results, knee_analysis=None):
     import matplotlib.pyplot as plt
@@ -500,7 +426,7 @@ def plot_progressive_ablation_curves(results, knee_analysis=None):
                 markersize=10, zorder=5, label='Knee point')
         ax.annotate(f"{mk['knee_x']}ch ({mk['knee_y']:.3f})",
                     xy=(mk['knee_x'], mk['knee_y']),
-                    xytext=(mk['knee_x'] + 5, mk['knee_y'] - 0.06),
+                    xytext=(mk['knee_x'] - 5, mk['knee_y'] - 0.06),
                     arrowprops=dict(arrowstyle='->', color='#8e44ad', lw=1.5),
                     fontsize=10, color='#8e44ad', fontweight='bold')
     ax.axhline(y=0.25, color='black', linestyle=':', alpha=0.5, label='Chance (4-class)')
@@ -508,7 +434,7 @@ def plot_progressive_ablation_curves(results, knee_analysis=None):
     ax.set_ylabel('Accuracy', fontsize=12)
     ax.set_title('Progressive Electrode Ablation', fontsize=14)
     ax.legend(fontsize=9)
-    ax.set_xlim(0, 65)
+    ax.set_xlim(65, 0)
     ax.set_ylim(0.2, 0.85)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -518,13 +444,11 @@ def plot_progressive_ablation_curves(results, knee_analysis=None):
 
 
 def _make_topo_info():
-    """Create MNE Info with valid montage positions for SEED-IV channels."""
     import mne
     mapped_names = [MNE_NAME_MAP.get(n, n) for n in CHANNEL_NAMES]
     info = mne.create_info(ch_names=mapped_names, sfreq=1, ch_types='eeg')
     montage = mne.channels.make_standard_montage('standard_1005')
     info.set_montage(montage, on_missing='ignore')
-    # Filter to channels that received valid montage positions
     picks = [i for i, ch in enumerate(info['chs'])
              if not np.allclose(ch['loc'][:3], 0)]
     if len(picks) < len(mapped_names):
@@ -541,35 +465,29 @@ def plot_topographic_importance(grand_importance,
     import matplotlib.pyplot as plt
     import mne
     info, picks = _make_topo_info()
-    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-    mne.viz.plot_topomap(grand_importance[picks], info, axes=ax, show=False,
-                         cmap='RdYlBu_r', contours=0, extrapolate='head',
-                         outlines='head', sensors=True)
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    im, _ = mne.viz.plot_topomap(grand_importance[picks], info, axes=ax, show=False,
+                         cmap='inferno', contours=0, extrapolate='head',
+                         outlines='head', sensors=False, sphere=(0.0, 0.0, 0.0, 0.105))
     ax.set_title(title, fontsize=13)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Importance', fontsize=10)
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"Saved {filename}")
     plt.close()
 
 
 def plot_cumulative_topomaps(all_seed_arrays, seed_idx, metric_name):
-    """Plot cumulative topomap averaging seeds 0..seed_idx.
-
-    Args:
-        all_seed_arrays: list of (N_SUBJECTS, N_CHANNELS) arrays, length >= seed_idx+1
-        seed_idx: 0-based index of current seed
-        metric_name: e.g. 'pi', 'ig'
-    """
     import matplotlib.pyplot as plt
     import mne
     info, picks = _make_topo_info()
-    # Cumulative grand average: mean across subjects per seed, then across seeds
     cumulative = np.array(
         [arr.mean(axis=0) for arr in all_seed_arrays[:seed_idx + 1]])
     grand = cumulative.mean(axis=0)
     fig, ax = plt.subplots(1, 1, figsize=(6, 6))
     mne.viz.plot_topomap(grand[picks], info, axes=ax, show=False,
                          cmap='RdYlBu_r', contours=0, extrapolate='head',
-                         outlines='head', sensors=True)
+                         outlines='head', sensors=True, sphere=(0.0, 0.0, 0.0, 0.105))
     n_seeds_so_far = seed_idx + 1
     ax.set_title(f'{metric_name} — cumulative avg (seeds 1-{n_seeds_so_far})',
                  fontsize=13)
@@ -681,7 +599,7 @@ def plot_per_emotion_topomap(emotion_importances,
         mne.viz.plot_topomap(ranked, info, axes=axes[c],
                              show=False, cmap='RdYlBu_r', contours=0,
                              vlim=(0, 1), extrapolate='head',
-                             outlines='head', sensors=True)
+                             outlines='head', sensors=True, sphere=(0.0, 0.0, 0.0, 0.105))
         axes[c].set_title(emotion_labels.get(c, str(c)), fontsize=13)
     plt.suptitle(title, fontsize=15, y=1.02)
     plt.tight_layout()
@@ -691,7 +609,6 @@ def plot_per_emotion_topomap(emotion_importances,
 
 
 def plot_ablation_summary_heatmap(results):
-    """Single heatmap: rows = regions + lobes, columns = [Keep Only, Remove]."""
     import matplotlib.pyplot as plt
 
     regions = list(REGIONS_FINE.keys())
@@ -728,7 +645,6 @@ def plot_ablation_summary_heatmap(results):
 
 
 def plot_per_subject_accuracy(sognn_results):
-    """Bar chart of per-subject LOSO accuracy with mean line."""
     import matplotlib.pyplot as plt
 
     subjects = sorted(sognn_results.keys())
@@ -757,7 +673,6 @@ def plot_per_subject_accuracy(sognn_results):
 
 
 def plot_per_subject_knee(knee_analysis):
-    """Bar chart of per-subject knee channel counts."""
     import matplotlib.pyplot as plt
 
     knees = knee_analysis['per_subject_knees']
@@ -766,7 +681,6 @@ def plot_per_subject_knee(knee_analysis):
     mean_subj_knee = knee_analysis['knee_summary']['mean']
     mean_curve_knee = knee_analysis['mean_knee']['knee_x']
 
-    # RdYlGn color gradient (normalize channels to [0,1] range)
     vmin, vmax = min(channels), max(channels)
     if vmax > vmin:
         normed = [(c - vmin) / (vmax - vmin) for c in channels]
@@ -795,51 +709,51 @@ def plot_per_subject_knee(knee_analysis):
 
 
 def plot_knee_explanation(knee_analysis, ablation_results):
-    """Two-panel diagram explaining the knee-point method."""
     import matplotlib.pyplot as plt
 
-    curve = ablation_results['progressive_pi_least_first']
-    sorted_nk = sorted(curve.keys(), key=int, reverse=True)
+    curve_lf = ablation_results['progressive_pi_least_first']
+    sorted_nk = sorted(curve_lf.keys(), key=int, reverse=True)
     x_vals = np.array([int(nk) for nk in sorted_nk])
-    mean_acc = np.array([curve[nk]['mean'] for nk in sorted_nk])
+    mean_acc = np.array([curve_lf[nk]['mean'] for nk in sorted_nk])
     mk = knee_analysis['mean_knee']
     distances = mk['distances']
     knee_idx = mk['knee_index']
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5.5),
+                                   gridspec_kw={'width_ratios': [1.2, 1]})
 
-    # Left panel: curve + chord + perpendicular distances
-    ax1.plot(x_vals, mean_acc, 'o-', color='#2ecc71', linewidth=2,
-             label='PI least first')
-    # Chord line
-    ax1.plot([x_vals[0], x_vals[-1]], [mean_acc[0], mean_acc[-1]],
-             '--', color='#7f8c8d', linewidth=1.5, label='Chord')
-    # Project each point onto the chord for distance lines
-    x0, y0 = float(x_vals[0]), float(mean_acc[0])
-    x1, y1 = float(x_vals[-1]), float(mean_acc[-1])
-    dx, dy = x1 - x0, y1 - y0
-    chord_len_sq = dx ** 2 + dy ** 2
-    for i in range(len(x_vals)):
-        if distances[i] < 1e-8:
+    curves_to_plot = [
+        ('progressive_pi_most_first',  '#e74c3c', 'PI most first',  '-', 'o'),
+        ('progressive_random',         '#95a5a6', 'Random',         '-', 'o'),
+        ('progressive_pi_least_first', '#2ecc71', 'PI least first', '-', 'o'),
+    ]
+    for key, color, label, ls, marker in curves_to_plot:
+        if key not in ablation_results:
             continue
-        # Project point onto chord to find foot of perpendicular
-        t = ((x_vals[i] - x0) * dx + (mean_acc[i] - y0) * dy) / chord_len_sq
-        foot_x = x0 + t * dx
-        foot_y = y0 + t * dy
-        color = '#e74c3c' if i == knee_idx else '#bdc3c7'
-        lw = 2.0 if i == knee_idx else 0.8
-        ax1.plot([x_vals[i], foot_x], [mean_acc[i], foot_y],
-                 color=color, linewidth=lw, alpha=0.7)
-    ax1.plot(mk['knee_x'], mk['knee_y'], 'D', color='#8e44ad',
-             markersize=12, zorder=5, label=f"Knee ({mk['knee_x']}ch)")
+        c = ablation_results[key]
+        n_ch = sorted(c.keys(), key=int)
+        xv = [int(n) for n in n_ch]
+        means = [c[n]['mean'] for n in n_ch]
+        stds  = [c[n]['std']  for n in n_ch]
+        ax1.plot(xv, means, marker=marker, color=color, label=label,
+                 linewidth=2, linestyle=ls)
+        ax1.fill_between(xv,
+                         [m - s for m, s in zip(means, stds)],
+                         [m + s for m, s in zip(means, stds)],
+                         alpha=0.12, color=color)
+
+    ax1.plot([x_vals[0], x_vals[-1]], [mean_acc[0], mean_acc[-1]],
+             '--', color='#7f8c8d', linewidth=1.5, label='Chord', zorder=2)
+
+    ax1.set_xlim(65, 0)
+    ax1.set_ylim(0.2, 0.85)
     ax1.set_xlabel('Number of Remaining Channels', fontsize=12)
     ax1.set_ylabel('Accuracy', fontsize=12)
-    ax1.set_title('Knee Detection: Max Distance to Chord', fontsize=13)
-    ax1.legend(fontsize=9)
-    ax1.grid(True, alpha=0.3)
+    ax1.set_title('Progressive Ablation with Knee Detection', fontsize=13)
+    ax1.axhline(y=0.25, color='black', linestyle=':', alpha=0.5,
+                label='Chance (4-class)')
 
-    # Right panel: bar chart of perpendicular distances
-    bar_colors = ['#e74c3c' if i == knee_idx else '#3498db'
+    bar_colors = ['#8e44ad' if i == knee_idx else '#3498db'
                   for i in range(len(x_vals))]
     ax2.bar(range(len(x_vals)), distances, color=bar_colors, alpha=0.8)
     ax2.set_xticks(range(len(x_vals)))
@@ -851,14 +765,47 @@ def plot_knee_explanation(knee_analysis, ablation_results):
     ax2.grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()
-    plt.savefig('knee_explanation.pdf', dpi=300, bbox_inches='tight')
+    fig.canvas.draw()
+
+    # Perpendicular lines in display coords so they look correct on screen
+    renderer = fig.canvas.get_renderer()
+    trans = ax1.transData
+    inv_trans = trans.inverted()
+    p0_disp = np.array(trans.transform((float(x_vals[0]), float(mean_acc[0]))))
+    p1_disp = np.array(trans.transform((float(x_vals[-1]), float(mean_acc[-1]))))
+    chord_disp = p1_disp - p0_disp
+    chord_len_sq_disp = np.dot(chord_disp, chord_disp)
+    for i in range(len(x_vals)):
+        if distances[i] < 1e-8:
+            continue
+        pi_disp = np.array(trans.transform((float(x_vals[i]), float(mean_acc[i]))))
+        t = np.dot(pi_disp - p0_disp, chord_disp) / chord_len_sq_disp
+        foot_disp = p0_disp + t * chord_disp
+        foot_data = inv_trans.transform(foot_disp)
+        color = '#8e44ad' if i == knee_idx else '#bdc3c7'
+        lw = 2.0 if i == knee_idx else 0.8
+        alpha = 0.9 if i == knee_idx else 0.5
+        ax1.plot([x_vals[i], foot_data[0]], [mean_acc[i], foot_data[1]],
+                 color=color, linewidth=lw, alpha=alpha,
+                 zorder=3 if i == knee_idx else 1)
+
+    ax1.plot(mk['knee_x'], mk['knee_y'], marker='D', color='#8e44ad',
+             markersize=11, zorder=6, label=f"Knee ({int(mk['knee_x'])}ch)",
+             markeredgecolor='white', markeredgewidth=1.2)
+    ax1.annotate(f"{int(mk['knee_x'])}ch ({mk['knee_y']:.3f})",
+                 xy=(mk['knee_x'], mk['knee_y']),
+                 xytext=(mk['knee_x'] + 15, mk['knee_y'] - 0.15),
+                 arrowprops=dict(arrowstyle='->', color='#8e44ad', lw=1.5),
+                 fontsize=10, color='#8e44ad', fontweight='bold')
+    ax1.legend(fontsize=8.5, loc='upper right')
+    ax1.grid(True, alpha=0.3)
+
+    plt.savefig('knee_explanation.pdf', dpi=300)
     print("Saved knee_explanation.pdf")
     plt.close()
 
 
-# ────────────────────────────────────────────────────────────────────
-# Main pipeline
-# ────────────────────────────────────────────────────────────────────
+# --- Main ---
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='EEG Electrode Ablation Study on SEED-IV')
@@ -878,7 +825,6 @@ if __name__ == '__main__':
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # ── Phase 0: Load all data with per-session z-score normalization ──
     print("\n=== Phase 0: Loading data ===")
     data_root = Path(args.data_root)
     if not data_root.is_dir():
@@ -902,14 +848,12 @@ if __name__ == '__main__':
         sizes = [data[subj][s][0].shape[0] for s in range(1, N_SESSIONS + 1)]
         print(f"  Subject {subj:2d}: {sizes} samples per session")
 
-    # ── Fixed hyperparameters (matching SOGNN paper) ──
     model_kwargs = {'n_electrodes': N_CHANNELS, 'n_bands': N_BANDS,
                     'n_timeframes': T_FIXED, 'n_classes': N_CLASSES,
                     'top_k': 10, 'dropout': 0.1}
     train_kwargs = {'lr': 1e-5, 'wd': 1e-4, 'batch_size': 16,
                     'max_epochs': 200, 'auc_threshold': 0.99}
 
-    # ── Phases 2+3+3b: Multi-seed ensemble (LOSO) ──
     n_seeds = args.n_seeds
     print(f"\n=== Multi-seed ensemble: {n_seeds} seed(s), LOSO ===")
     all_seed_models = []
@@ -922,15 +866,13 @@ if __name__ == '__main__':
         set_seed(seed)
         print(f"\n--- Seed {seed}/{n_seeds} ---")
 
-        # Phase 2: LOSO train/test
-        print(f"  Phase 2: LOSO training (seed {seed})")
+        print(f"  LOSO training (seed {seed})")
         results_k, models_k = train_and_evaluate(
             data, SOGNN, model_kwargs, train_kwargs, device)
         all_seed_results.append(results_k)
         all_seed_models.append(models_k)
 
-        # Phase 3: Permutation importance (on held-out subject's ALL sessions)
-        print(f"  Phase 3: Permutation importance (seed {seed})")
+        print(f"  Permutation importance (seed {seed})")
         imp_k = np.zeros((N_SUBJECTS, N_CHANNELS))
         pi_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'PI seed {seed}')
         for subj in pi_bar:
@@ -942,7 +884,6 @@ if __name__ == '__main__':
                 models_k[subj], X_test, y_test, device, n_repeats=10)
         all_seed_importances.append(imp_k)
 
-        # Per-emotion PI
         emo_k = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
         emo_bar = tqdm(range(1, N_SUBJECTS + 1), desc=f'Emo-PI seed {seed}')
         for subj in emo_bar:
@@ -958,19 +899,15 @@ if __name__ == '__main__':
             emo_k[c] /= N_SUBJECTS
         all_seed_emotion_imp.append(emo_k)
 
-        # Per-seed summary
         seed_grand = imp_k.mean(axis=0)
         seed_ranking = seed_grand.argsort()[::-1]
         print(f"  Seed {seed} top-5 PI: "
               f"{[CHANNEL_NAMES[i] for i in seed_ranking[:5]]}")
 
-        # Cumulative topomaps (running average of seeds 1..current)
         plot_cumulative_topomaps(all_seed_importances, seed_idx, 'pi')
 
-    # ── Aggregate importance across seeds ──
     print("\n=== Aggregating across seeds ===")
 
-    # PI: (K, 62) — each row is one seed's grand avg over subjects
     seed_grand_importances = np.array(
         [imp.mean(axis=0) for imp in all_seed_importances])
     grand_importance = seed_grand_importances.mean(axis=0)
@@ -979,7 +916,6 @@ if __name__ == '__main__':
     print("  Ensemble PI top-10:",
           [CHANNEL_NAMES[i] for i in grand_ranking[:10]])
 
-    # Test accuracy: per-subject average across seeds
     sognn_results = {}
     for subj in range(1, N_SUBJECTS + 1):
         sognn_results[subj] = float(np.mean(
@@ -988,7 +924,6 @@ if __name__ == '__main__':
     print(f"  Ensemble mean accuracy: {np.mean(accs):.4f} "
           f"+/- {np.std(accs):.4f}")
 
-    # Per-emotion importance: average across seeds
     grand_emotion_imp = {c: np.zeros(N_CHANNELS) for c in range(N_CLASSES)}
     for emo_k in all_seed_emotion_imp:
         for c in emo_k:
@@ -996,7 +931,6 @@ if __name__ == '__main__':
     for c in grand_emotion_imp:
         grand_emotion_imp[c] /= n_seeds
 
-    # ── Cross-seed stability diagnostics ──
     if n_seeds > 1:
         from scipy.stats import spearmanr
         rhos = []
@@ -1009,8 +943,7 @@ if __name__ == '__main__':
               f"{np.mean(rhos):.4f} "
               f"(min={np.min(rhos):.4f}, max={np.max(rhos):.4f})")
 
-    # ── Phase 4: Full ablation study (averaged across seeds) ──
-    print("\n=== Phase 4: Ablation study ===")
+    print("\n=== Ablation study ===")
     all_seed_ablations = []
     for seed_idx in range(n_seeds):
         print(f"  Ablation with seed {seed_idx + 1} models...")
@@ -1018,7 +951,6 @@ if __name__ == '__main__':
             all_seed_models[seed_idx], data, grand_ranking, device)
         all_seed_ablations.append(abl_k)
 
-    # Average ablation results across seeds
     ablation_results = {}
     first_abl = all_seed_ablations[0]
     for key in first_abl:
@@ -1046,8 +978,7 @@ if __name__ == '__main__':
                 'per_subj': avg_per_subj,
             }
 
-    # ── Phase 5: Visualization & statistics ──
-    print("\n=== Phase 5: Visualization ===")
+    print("\n=== Visualization ===")
     knee_analysis = compute_knee_analysis(ablation_results)
     plot_progressive_ablation_curves(ablation_results, knee_analysis)
     plot_topographic_importance(grand_importance)
@@ -1060,7 +991,6 @@ if __name__ == '__main__':
     plot_per_subject_knee(knee_analysis)
 
 
-    # Wilcoxon signed-rank tests with Holm-Bonferroni correction
     print("\n=== Statistical tests (Wilcoxon, Holm-Bonferroni corrected) ===")
     from scipy import stats
     comparisons = [
@@ -1077,7 +1007,6 @@ if __name__ == '__main__':
         stat, p = stats.wilcoxon(accs_a, accs_b)
         raw_p_values.append(p)
         test_rows.append((cfg_a, cfg_b, stat, p))
-    # Holm-Bonferroni correction
     n_tests = len(raw_p_values)
     sorted_idx = np.argsort(raw_p_values)
     adjusted_p = np.ones(n_tests)
@@ -1094,7 +1023,6 @@ if __name__ == '__main__':
         print(f"  {cfg_a} vs {cfg_b}: p={raw_p:.4f} "
               f"(adj={adj_p:.4f}) {sig}")
 
-    # Save all results
     save_results = {
         'n_seeds': n_seeds,
         'evaluation': 'LOSO',

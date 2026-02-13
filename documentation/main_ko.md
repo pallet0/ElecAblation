@@ -2,54 +2,102 @@
 
 이 문서는 데이터 처리, 중요도 지표 및 통계적 검증을 포함한 SOGNN 전극 절제 파이프라인의 6단계 실행 흐름을 설명합니다.
 
-## 0단계: 데이터 로드 및 전처리
+## Phase 0: 데이터 로딩 및 전처리
 
-파이프라인은 SOGNN 원논문과 일치하는 **"one trial = one sample"** 접근 방식을 사용합니다.
+`load_seed4_session` 함수가 데이터 파이프라인을 구현합니다.
 
-1. **특징 추출**: `.mat` 파일에서 차분 엔트로피(DE) 특징을 로드합니다.
-2. **정규화**: 패딩을 적용하기 *전*에 세션 내 모든 프레임에 대해 z-score 통계량(평균, 표준편차)을 계산합니다.
-3. **시간적 정렬**: 트라이얼을 `T_FIXED = 64` 시간 프레임으로 제로 패딩하거나 자릅니다.
-4. **재구성**: 샘플당 최종 출력 형태는 `(62, 5, 64)` (채널, 대역, 시간)입니다.
-
-## 1 및 2단계: 훈련 및 앙상블
-
-결과의 통계적 안정성을 보장하기 위해 파이프라인은 **다중 시드 앙상블(Multi-seed Ensemble)**을 사용합니다.
-
-- **평가 프로토콜**: Leave-One-Subject-Out (LOSO). 각 피험자에 대해 14명의 데이터로 모델을 훈련하고 15번째 피험자로 테스트합니다.
-- **앙상블**: LOSO 프로세스는 `n_seeds` 횟수(기본값 5)만큼 반복됩니다. 중요도 점수와 정확도는 시드 전체에 대해 평균화됩니다.
-- **훈련 로직**: Adam 옵티마이저(`lr=1e-5`), 훈련 AUC(임계값 0.99) 및 정확도 기반 조기 종료, Cross-Entropy 손실을 사용합니다.
-
-## 3단계: 전극 중요도 지표
-
-파이프라인은 각 전극에 대해 중요도 점수를 계산합니다.
-
-1. **순열 중요도 (Permutation Importance, PI)**: 특정 채널의 데이터를 샘플 간에 셔플했을 때 모델 정확도가 얼마나 하락하는지 측정합니다. 모델에 구애받지 않는 인과적으로 유효한 방법으로, 전극의 전역적 기여도를 포착합니다.
-2. **감정별 중요도**: 각 감정 클래스별로 PI를 별도로 계산하여 감정별로 특화된 뇌 영역을 식별합니다.
-
-## 4단계: 절제 실험 (Ablation Studies)
-
-절제 실험은 정보가 제거됨에 따라 모델 성능이 어떻게 저하되는지 정량화합니다.
-
-- **마스크 기반 (즉시 평가)**: 사전 훈련된 62채널 모델의 입력에 이진 마스크를 적용합니다. 많은 구성을 테스트하는 데 효율적입니다.
-- **바닥부터 재훈련 (Retrain-from-scratch)**: 축소된 전극 서브셋만을 사용하여 새로운 SOGNN 모델을 초기화하고 훈련합니다. 모델이 축소된 특징 공간에 실제로 적응할 수 있는지 검증합니다.
-- **점진적 절제 (Progressive Ablation)**: 평균 PI 점수(Grand Ranking)를 기반으로 전극을 하나씩(또는 단계별로) 제거합니다. 이를 통해 채널 수와 정확도 사이의 관계를 보여주는 곡선을 생성하고 **무릎 지점(Knee Point)**을 찾습니다.
-
-## 5단계: 시각화 및 통계
-
-결과는 다음과 같은 PDF 보고서로 종합됩니다.
-
-- **토포그래픽 맵 (Topographic Maps)**: PI 중요도 점수를 2D 두피 투영도로 시각화합니다.
-- **절제 곡선 (Ablation Curves)**: 채널 수 대비 정확도를 플로팅하며, 채널 추가의 효율이 급격히 떨어지는 **무릎 지점**을 강조합니다.
-- **지역/뇌엽 테이블**: 해부학적 서브셋별 성능을 비교하는 막대 그래프와 히트맵을 생성합니다.
-- **통계 검정**: 주요 구성(예: 전체 62채널 vs 10-20 시스템) 간에 **Wilcoxon 부호 순위 검정**을 수행하며, 다중 비교를 위해 **Holm-Bonferroni 교정**을 적용합니다.
-
-## 명령줄 인터페이스 (CLI)
-
-```bash
-python main.py [options]
+```python
+def load_seed4_session(mat_path, session_idx):
+    data = sio.loadmat(mat_path)
+    labels = SESSION_LABELS[session_idx]
+    # ... 트라이얼 추출 ...
+    
+    # 패딩 전 모든 프레임에서 z-score 통계 계산
+    all_frames = np.concatenate(trials_raw, axis=0)  # [Line 9]
+    mean = all_frames.mean(axis=0, keepdims=True)    # [Line 10]
+    std = all_frames.std(axis=0, keepdims=True) + 1e-8
+    
+    # 각 트라이얼 정규화, 제로 패딩 및 (62, 5, T_FIXED)로 전치
+    X_list = []
+    for trial in trials_raw:
+        trial_normed = (trial - mean) / std          # [Line 11]
+        # ... T_FIXED로 패딩/절단 ...
+        X_list.append(trial_padded.transpose(1, 2, 0))
+    # ...
 ```
 
-- `--data_root`: SEED-IV 특징 데이터 경로.
-- `--n_seeds`: 앙상블 반복 횟수 (기본값: 5).
-- `--retrain_ablation`: 비용이 많이 드는 '재훈련 기반 절제 실험' 활성화.
-- `--notebook`: Jupyter/Colab 환경에 맞게 진행률 표시줄 형식을 변경.
+### 라인별 상세 설명 (전처리)
+- **Line 9 (`np.concatenate(trials_raw, axis=0)`)**: 서로 다른 시간 길이를 가진 모든 트라이얼들을 하나의 거대한 배열로 합칩니다. 이는 전체 세션에 대한 글로벌 통계량을 계산하기 위해 필요합니다.
+- **Line 10 (`all_frames.mean(...)`)**: 전체 세션 동안 각 (채널, 대역) 쌍에 대한 평균 차분 엔트로피(DE) 값을 계산합니다.
+- **Line 11 (`(trial - mean) / std`)**: 실제 Z-score 정규화를 수행합니다. 세션 전체의 평균과 표준편차를 사용함으로써, 세션 간의 편차는 제거하면서 동일 세션 내의 서로 다른 트라이얼 간의 상대적인 강도 차이는 보존합니다.
+
+## Phase 1 & 2: 훈련 및 앙상블
+
+파이프라인은 안정성을 보장하기 위해 여러 무작위 시드(seed)에 대해 반복되는 **Leave-One-Subject-Out (LOSO)** 교차 검증을 사용합니다.
+
+```python
+def train_and_evaluate(data, model_cls, model_kwargs, train_kwargs, device='cuda'):
+    # ...
+    for test_subj in subj_bar:
+        # [Line 12] 훈련을 위해 다른 모든 피험자의 모든 세션을 통합
+        X_train = np.concatenate([data[s][sess][0] ... if s != test_subj ...])
+        # [Line 13] 테스트를 위해 제외된 피험자의 모든 세션을 통합
+        X_test = np.concatenate([data[test_subj][sess][0] ...])
+        # ... 훈련 루프 ...
+```
+
+### 라인별 상세 설명 (LOSO)
+- **Line 12 (`X_train = ...`)**: 15명 중 14명의 데이터를 모아 훈련 세트를 구성합니다. 이는 모델이 완전히 새로운 사람(피험자 독립 과제)에 대해 얼마나 잘 일반화되는지 테스트하기 위함입니다.
+- **Line 13 (`X_test = ...`)**: 15번째 피험자의 데이터는 오직 평가를 위해서만 엄격하게 분리하여 유지합니다.
+
+## Phase 3: 전극 중요도 지표
+
+중요도는 **치환 중요도 (Permutation Importance, PI)**를 사용하여 계산됩니다.
+
+```python
+def permutation_importance(model, X, y, device, n_repeats=10):
+    # ...
+    for ch in range(n_channels):
+        # [Line 14] 배치 전체에서 채널 'ch'의 데이터를 섞음 (shuffle)
+        X_perm[:, ch, :, :] = X_perm[perm_idx, ch, :, :]
+        # [Line 15] 정확도 하락 측정
+        # ...
+        acc_importances[ch] = baseline_acc - float(np.mean(shuffled_accs))
+```
+
+### 라인별 상세 설명 (중요도)
+- **Line 14 (`X_perm[:, ch, ...] = ...`)**: 절제 로직의 핵심입니다. 특정 채널의 데이터를 샘플 간에 무작위로 섞음으로써, 해당 전극의 신호와 실제 감정 레이블 사이의 관계를 파괴합니다. 이때 신호 자체의 분포(평균/분산)는 그대로 유지됩니다.
+- **Line 15 (`baseline_acc - ...`)**: 데이터를 섞은 후 정확도가 크게 떨어진다면, 이는 모델이 결정을 내릴 때 해당 전극에 크게 의존하고 있었음을 증명합니다.
+
+## Phase 4: 절제 연구 (Ablation Studies)
+
+절제는 훈련된 모델의 입력에 이진 마스크(binary mask)를 적용하여 수행됩니다.
+
+```python
+def evaluate(model, loader, device, channel_mask=None):
+    # ...
+    if channel_mask is not None:
+        mask = channel_mask.to(device).unsqueeze(-1).unsqueeze(-1)  # (1,C,1,1)
+        X_batch = X_batch * mask
+    logits = model(X_batch)
+    # ...
+```
+
+- **점진적 절제 (Progressive Ablation)**: "Grand Ranking" (모든 피험자 및 시드에 대한 평균 PI)을 기반으로 전극을 하나씩 제거합니다. 이를 통해 정확도 곡선이 생성됩니다.
+- **무릎 지점 탐지 (Knee Point Detection)**: 절제 곡선에서 최대 곡률 지점(무릎 지점)을 찾아 "최적"의 전극 수를 결정합니다.
+
+## Phase 5: 시각화 및 통계
+
+결과는 `matplotlib` 및 `mne`를 사용하여 여러 플롯으로 합성됩니다.
+
+- **토포그래픽 맵 (Topographic Maps)**: `mne.viz.plot_topomap`을 사용하여 중요도 점수를 2D 두피 표현에 투영합니다.
+- **통계 검정**: `scipy.stats.wilcoxon`을 사용하여 서로 다른 구성(예: 전체 62채널 vs 10-20 시스템)을 비교하고, 가족오류율(family-wise error rate)을 제어하기 위해 **Holm-Bonferroni 보정**을 적용합니다.
+
+```python
+# Holm-Bonferroni 보정 스니펫
+n_tests = len(raw_p_values)
+sorted_idx = np.argsort(raw_p_values)
+for rank, idx in enumerate(sorted_idx):
+    adjusted_p[idx] = raw_p_values[idx] * (n_tests - rank)
+# ... 단조성 유지 ...
+```

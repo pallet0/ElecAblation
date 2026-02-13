@@ -1,6 +1,6 @@
-"""Constants and electrode mappings for SEED-IV ablation study."""
+"""SEED-IV constants and electrode mappings."""
 
-# ── SEED-IV channel layout (62 channels, 0-indexed) ──
+# Channel layout (62 channels, 0-indexed)
 CHANNEL_NAMES = [
     'FP1','FPZ','FP2','AF3','AF4',                          # 0-4
     'F7','F5','F3','F1','FZ','F2','F4','F6','F8',           # 5-13
@@ -20,14 +20,14 @@ T_FIXED = 64     # temporal padding length (SOGNN paper SEED-IV setting)
 
 DATA_ROOT = r'C:\Users\palle\Desktop\QIProject\ResStab_SEED-IV\SEED_IV\eeg_feature_smooth'
 
-# Labels per session (from SEED-IV ReadMe)
+# Labels per session (SEED-IV ReadMe)
 SESSION_LABELS = [
     [1,2,3,0,2,0,0,1,0,1,2,1,1,1,2,3,2,2,3,3,0,3,0,3],
     [2,1,3,0,0,2,0,2,3,3,2,3,2,0,1,1,2,1,0,3,0,1,3,1],
     [1,2,2,1,3,3,3,1,1,2,1,0,2,3,3,0,2,3,0,0,2,0,1,0],
 ]
 
-# ── Non-overlapping regional groupings (8 strips, anterior→posterior) ──
+# Regional groupings (8 strips, anterior -> posterior)
 REGIONS_FINE = {
     'prefrontal':        [0, 1, 2, 3, 4],
     'frontal':           [5, 6, 7, 8, 9, 10, 11, 12, 13],
@@ -39,7 +39,7 @@ REGIONS_FINE = {
     'occipital':         [57, 58, 59, 60, 61],
 }
 
-# ── Hemisphere groupings ──
+# Hemispheres
 HEMISPHERES = {
     'left':    [0,3,5,6,7,8,14,15,16,17,23,24,25,26,
                 32,33,34,35,41,42,43,44,50,51,52,57,58],
@@ -48,7 +48,7 @@ HEMISPHERES = {
                 37,38,39,40,46,47,48,49,54,55,56,60,61],
 }
 
-# ── Anatomical lobe groupings ──
+# Lobes
 LOBES = {
     'frontal':   [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],  # Fp + AF + F
     'temporal':  [14, 22, 23, 31, 32, 40],                           # FT7/8, T7/8, TP7/8
@@ -59,12 +59,12 @@ LOBES = {
     'occipital': [50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61], # PO + CB + O
 }
 
-# ── Standard montage subsets ──
+# Standard montage subsets
 STANDARD_1020 = [0,2,5,7,9,11,13,23,25,27,29,31,41,43,45,47,49,58,60]
 EMOTIV_EPOC   = [3,4,5,7,13,11,15,21,23,31,41,49,58,60]
 MUSE_APPROX   = [3,4,32,40]
 
-# ── MNE name mapping for topographic plotting ──
+# MNE name mapping for topographic plotting
 MNE_NAME_MAP = {
     'FP1': 'Fp1', 'FPZ': 'Fpz', 'FP2': 'Fp2',
     'FZ': 'Fz', 'FCZ': 'FCz', 'CZ': 'Cz', 'CPZ': 'CPz',
